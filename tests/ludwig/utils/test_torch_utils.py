@@ -1,0 +1,108 @@
+import contextlib
+import os
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from ludwig.utils.torch_utils import (
+    _get_torch_init_params,
+    _set_torch_init_params,
+    initialize_pytorch,
+    sequence_length_2D,
+    sequence_length_3D,
+)
+
+_CUDA_AVAILABLE = torch.cuda.is_available() and torch.cuda.device_count() > 0
+
+
+@pytest.mark.parametrize("input_sequence", [[[0, 1, 1], [2, 0, 0], [3, 3, 3]]])
+@pytest.mark.parametrize("expected_output", [[3, 2, 3]])
+def test_sequence_length_2D(input_sequence: list[list[int]], expected_output: list[int]):
+    output_seq_length = sequence_length_2D(torch.tensor(input_sequence))
+    assert torch.equal(torch.tensor(expected_output), output_seq_length)
+
+
+@pytest.mark.parametrize("input_sequence", [[[[-1, 0, 1], [1, -2, 0]], [[0, 0, 0], [3, 0, -2]]]])
+@pytest.mark.parametrize("expected_output", [[2, 1]])
+def test_sequence_length_3D(input_sequence: list[list[list[int]]], expected_output: list[int]):
+    input_sequence = torch.tensor(input_sequence, dtype=torch.int32)
+    expected_output = torch.tensor(expected_output, dtype=torch.int32)
+    output_seq_length = sequence_length_3D(input_sequence)
+    assert torch.equal(expected_output, output_seq_length)
+
+
+@contextlib.contextmanager
+def clean_params():
+    prev = _get_torch_init_params()
+    prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        _set_torch_init_params(None)
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
+        yield
+    finally:
+        _set_torch_init_params(prev)
+        # Restore CUDA_VISIBLE_DEVICES to prevent contaminating other tests
+        if prev_cuda is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda
+        elif "CUDA_VISIBLE_DEVICES" in os.environ:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
+
+
+def test_initialize_pytorch_only_once():
+    """Second call with identical params is a no-op; mismatched params emit a warning."""
+    with clean_params():
+        initialize_pytorch(allow_parallel_threads=True)
+        assert _get_torch_init_params() == (None, None, True)
+
+        # Exact same params: silent no-op, stored params unchanged
+        initialize_pytorch(allow_parallel_threads=True)
+        assert _get_torch_init_params() == (None, None, True)
+
+        # Different params: warns, still no-op
+        with pytest.warns(UserWarning, match="already been initialized"):
+            initialize_pytorch(allow_parallel_threads=False)
+        assert _get_torch_init_params() == (None, None, True)
+
+
+@pytest.mark.skipif(not _CUDA_AVAILABLE, reason="requires CUDA")
+@patch("ludwig.utils.torch_utils.torch")
+def test_initialize_pytorch_with_gpu_list(mock_torch):
+    # For test purposes, these devices can be anything, we just need to be able to uniquely
+    # identify them.
+    mock_torch.cuda.is_available.return_value = True
+    mock_torch.cuda.device_count.return_value = 4
+    with clean_params():
+        initialize_pytorch(gpus=[1, 2])
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "1,2"
+
+
+@pytest.mark.skipif(not _CUDA_AVAILABLE, reason="requires CUDA")
+@patch("ludwig.utils.torch_utils.torch")
+def test_initialize_pytorch_with_gpu_string(mock_torch):
+    mock_torch.cuda.is_available.return_value = True
+    mock_torch.cuda.device_count.return_value = 4
+    with clean_params():
+        initialize_pytorch(gpus="1,2")
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "1,2"
+
+
+@pytest.mark.skipif(not _CUDA_AVAILABLE, reason="requires CUDA")
+@patch("ludwig.utils.torch_utils.torch")
+def test_initialize_pytorch_with_gpu_int(mock_torch):
+    mock_torch.cuda.is_available.return_value = True
+    mock_torch.cuda.device_count.return_value = 4
+    with clean_params():
+        initialize_pytorch(gpus=1)
+        mock_torch.cuda.set_device.assert_called_with(1)
+        assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+@patch("ludwig.utils.torch_utils.torch")
+def test_initialize_pytorch_without_gpu(mock_torch):
+    mock_torch.cuda.is_available.return_value = True
+    mock_torch.cuda.device_count.return_value = 4
+    with clean_params():
+        initialize_pytorch(gpus=-1)
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == ""

@@ -1,0 +1,19 @@
+version: 1.0
+name: sst2
+huggingface_dataset_id: stanfordnlp/sst2
+loader: hugging_face.HFLoader
+description: |
+  The SST2 dataset (Stanford Sentiment Treebank, binary).
+
+  Loaded from HuggingFace (stanfordnlp/sst2) since the original Stanford
+  download URL (nlp.stanford.edu) is no longer publicly accessible.
+
+  Labels: 0=negative, 1=positive.
+columns:
+  - name: sentence
+    type: text
+  - name: label
+    type: binary
+output_features:
+  - name: label
+    type: binary

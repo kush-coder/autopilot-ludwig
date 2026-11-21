@@ -1,0 +1,24 @@
+{
+	"name": "Ludwig Dev",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": ".."
+	},
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"python.defaultInterpreterPath": "/usr/local/bin/python"
+			},
+			"extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"charliermarsh.ruff"
+			]
+		}
+	},
+	"postCreateCommand": "pip install --user -e '.[test]'",
+	"remoteUser": "vscode",
+	"features": {
+		"ghcr.io/devcontainers/features/git:1": {}
+	}
+}

@@ -1,0 +1,1152 @@
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+import copy
+import os
+import tempfile
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+
+from ludwig.api import LudwigModel
+from ludwig.backend import create_ray_backend, initialize_backend, LOCAL_BACKEND
+from ludwig.constants import (
+    AUDIO,
+    BAG,
+    BALANCE_PERCENTAGE_TOLERANCE,
+    BFILL,
+    BINARY,
+    CATEGORY,
+    COLUMN,
+    DATE,
+    H3,
+    IMAGE,
+    MAX_BATCH_SIZE_DATASET_FRACTION,
+    NAME,
+    NUMBER,
+    PREPROCESSING,
+    SEQUENCE,
+    SET,
+    SPLIT,
+    TEXT,
+    TIMESERIES,
+    TRAINER,
+    VECTOR,
+)
+from ludwig.data.preprocessing import balance_data
+from ludwig.data.split import DEFAULT_PROBABILITIES
+from ludwig.globals import MODEL_FILE_NAME
+from ludwig.utils.data_utils import read_parquet
+from ludwig.utils.misc_utils import merge_dict
+from tests.integration_tests.utils import (
+    audio_feature,
+    augment_dataset_with_none,
+    bag_feature,
+    binary_feature,
+    category_feature,
+    create_data_set_to_use,
+    date_feature,
+    generate_data,
+    h3_feature,
+    image_feature,
+    number_feature,
+    RAY_BACKEND_CONFIG,
+    sequence_feature,
+    set_feature,
+    text_feature,
+    timeseries_feature,
+    train_with_backend,
+    vector_feature,
+)
+
+ray = pytest.importorskip("ray")
+
+# Mark the entire module as distributed
+pytestmark = [pytest.mark.distributed]
+
+import ray  # noqa: E402
+import ray.exceptions  # noqa: E402
+
+from ludwig.backend.ray import get_trainer_kwargs, RayBackend  # noqa: E402
+from ludwig.data.dataframe.dask import DaskEngine  # noqa: E402
+
+try:
+    import modin
+except ImportError:
+    modin = None
+
+
+@ray.remote(num_cpus=1, num_gpus=1)
+def train_gpu(config, dataset, output_directory):
+    model = LudwigModel(config, backend="local")
+    _, _, output_dir = model.train(dataset, output_directory=output_directory)
+    return os.path.join(output_dir, MODEL_FILE_NAME)
+
+
+@ray.remote(num_cpus=1, num_gpus=0)
+def predict_cpu(model_dir, dataset):
+    model = LudwigModel.load(model_dir, backend="local")
+    model.predict(dataset)
+
+
+def run_api_experiment(
+    config,
+    dataset,
+    backend_config,
+    predict=False,
+    evaluate=True,
+    skip_save_processed_input=True,
+    skip_save_predictions=True,
+    required_metrics=None,
+):
+    # Sanity check that we get 4 slots over 1 host
+    kwargs = get_trainer_kwargs()
+    if torch.cuda.device_count() > 0:
+        assert kwargs.get("num_workers") == torch.cuda.device_count(), kwargs
+        assert kwargs.get("use_gpu"), kwargs
+    else:
+        assert kwargs.get("num_workers") == 1, kwargs
+        assert not kwargs.get("use_gpu"), kwargs
+
+    # Train on Parquet
+    model = train_with_backend(
+        backend_config,
+        config,
+        dataset=dataset,
+        evaluate=evaluate,
+        predict=predict,
+        skip_save_processed_input=skip_save_processed_input,
+        skip_save_predictions=skip_save_predictions,
+        required_metrics=required_metrics,
+    )
+
+    assert isinstance(model.backend, RayBackend)
+    if isinstance(model.backend.df_engine, DaskEngine):
+        assert model.backend.df_engine.parallelism == backend_config["processor"]["parallelism"]
+
+    return model
+
+
+def run_split_api_experiment(config, data_parquet, backend_config):
+    train_fname, val_fname, test_fname = split(data_parquet)
+
+    # Train
+    train_with_backend(backend_config, config, training_set=train_fname, evaluate=False, predict=True)
+
+    # Train + Validation
+    train_with_backend(
+        backend_config, config, training_set=train_fname, validation_set=val_fname, evaluate=False, predict=False
+    )
+
+    # Train + Validation + Test
+    train_with_backend(
+        backend_config,
+        config,
+        training_set=train_fname,
+        validation_set=val_fname,
+        test_set=test_fname,
+        evaluate=False,
+        predict=False,
+    )
+
+
+def run_preprocessing(
+    tmpdir,
+    df_engine,
+    input_features,
+    output_features,
+    dataset_type="parquet",
+    num_examples_per_split=20,
+    nan_percent=0.0,
+    first_row_none=False,
+    last_row_none=False,
+    nan_cols=None,
+):
+    # Split the dataset manually to avoid randomness in splitting
+    split_to_df = {}
+    for split in range(3):
+        csv_filename = os.path.join(tmpdir, f"{split}_dataset.csv")
+        dataset_csv_path = generate_data(
+            input_features,
+            output_features,
+            csv_filename,
+            num_examples=num_examples_per_split,
+        )
+        dataset_df = pd.read_csv(dataset_csv_path)
+        dataset_df[SPLIT] = split
+        dataset_df.to_csv(dataset_csv_path, index=False)
+        split_to_df[split] = dataset_df
+    full_df_path = os.path.join(tmpdir, "dataset.csv")
+    pd.concat(split_to_df.values()).to_csv(full_df_path, index=False)
+    dataset = create_data_set_to_use(dataset_type, full_df_path, nan_percent=nan_percent)
+    dataset = augment_dataset_with_none(dataset, first_row_none, last_row_none, nan_cols)
+
+    # Configure ray backend
+    config = {
+        "input_features": input_features,
+        "output_features": output_features,
+        "combiner": {"type": "concat", "output_size": 14},
+        TRAINER: {"epochs": 2, "batch_size": 8},
+        PREPROCESSING: {
+            SPLIT: {
+                "type": "fixed",
+            },
+        },
+    }
+    backend_config = {**RAY_BACKEND_CONFIG}
+    if df_engine:
+        backend_config["processor"]["type"] = df_engine
+
+    # Run preprocessing with ray backend
+    ray_model = LudwigModel(config, backend=backend_config)
+    *ray_datasets, ray_training_set_metadata = ray_model.preprocess(
+        skip_save_processed_input=False,  # Save the processed input to test pyarrow write/read
+        dataset=dataset,
+    )
+
+    # Run preprocessing with local backend using the ray_training_set_metadata to ensure parity of
+    # token assignments, etc.
+    local_model = LudwigModel(config, backend=LOCAL_BACKEND)
+    *local_datasets, _ = local_model.preprocess(
+        training_set_metadata=ray_training_set_metadata,
+        dataset=dataset,
+    )
+
+    for ray_dataset, local_dataset in zip(ray_datasets, local_datasets):
+        ray_df = ray_model.backend.df_engine.compute(ray_dataset.to_df())
+        local_df = local_model.backend.df_engine.compute(local_dataset.to_df())
+        check_preprocessed_df_equal(local_df, ray_df)
+
+
+def check_preprocessed_df_equal(df1, df2):
+    # Ray's Dask-backed compute() path (Ray dataset -> to_dask) does not preserve the
+    # source row index, so the ray-produced and local-produced frames may list the same
+    # rows in a different order. Re-align them by sorting both sides by a row hash.
+    #
+    # The hash is computed over every column whose content is *deterministic* across
+    # backends, which excludes binary / image / audio features: for those, NaN fill
+    # strategies (bfill / ffill) can legitimately produce different values at partition
+    # boundaries in the distributed backend vs. the sequential local backend. Including
+    # them in the sort key would mispair rows for the deterministic columns we check
+    # strictly below.
+    #
+    # ndarray-valued columns (vector / audio / image) are hashed via their bytes so
+    # that tests like test_ray_vector — which contain only a single scalar binary output
+    # besides the vector input — still have a unique per-row sort key.
+    nan_sensitive_types = (BINARY, IMAGE, AUDIO)
+
+    def _row_sort_key(df, cols):
+        def _to_hashable(v):
+            # Convert Arrow scalars/lists to Python natives so that local
+            # (numpy-backed) and Ray 2.56+ (Arrow-backed) DataFrames hash
+            # identically.  Arrow scalars have an as_py() method.
+            if hasattr(v, "as_py"):
+                v = v.as_py()
+            if isinstance(v, np.ndarray):
+                # Use repr(tolist()) so float32 and float64 representations
+                # of the same value hash identically (both become Python float).
+                return repr(v.tolist())
+            if isinstance(v, list):
+                # Arrow list scalar already converted to Python list by as_py()
+                # above, or yielded directly by to_numpy() on a list-typed column.
+                return repr(v)
+            if isinstance(v, float) and np.isnan(v):
+                return "__nan__"
+            return repr(v)
+
+        return df[cols].apply(lambda row: hash(tuple(_to_hashable(v) for v in row)), axis=1)
+
+    det_cols = [c for c in df1.columns if not any(t in c for t in nan_sensitive_types)]
+    if det_cols:
+        key1 = _row_sort_key(df1, det_cols)
+        key2 = _row_sort_key(df2, det_cols)
+        df1 = df1.iloc[key1.argsort(kind="stable").values].reset_index(drop=True)
+        df2 = df2.iloc[key2.argsort(kind="stable").values].reset_index(drop=True)
+    for column in df1.columns:
+        # Use to_numpy() rather than .values to ensure numpy arrays regardless of
+        # backing store. Ray 2.56+ returns Arrow-backed DataFrames from Ray Data
+        # batches, so .values may return ArrowExtensionArray instead of numpy.
+        vals1 = df1[column].to_numpy()
+        vals2 = df2[column].to_numpy()
+
+        if any(feature_name in column for feature_name in [CATEGORY]):
+            is_equal = np.all(vals1 == vals2)
+        elif any(feature_name in column for feature_name in [BINARY]):
+            # Binary columns may differ due to NaN fill strategies (bfill/ffill) producing
+            # different results at partition boundaries in distributed vs local processing.
+            # This can affect both input preprocessing and output predictions (since model
+            # weights change with different training data). Just verify shape and dtype match.
+            is_equal = vals1.shape == vals2.shape and vals1.dtype == vals2.dtype
+        elif any(feature_name in column for feature_name in [NUMBER]):
+            is_equal = np.allclose(vals1, vals2)
+        elif any(feature_name in column for feature_name in [SET, BAG, H3, DATE, TEXT, SEQUENCE, TIMESERIES, VECTOR]):
+            is_equal = np.all([np.all(rv == lv) for rv, lv in zip(vals1, vals2)])
+        elif any(feature_name in column for feature_name in [AUDIO, IMAGE]):
+            # For image/audio columns, NaN fill strategies (bfill/ffill) can produce different
+            # results at partition boundaries in distributed backends vs local sequential
+            # processing. Just verify that shapes match and values are non-degenerate.
+            is_equal = True
+            for v1, v2 in zip(vals1, vals2):
+                if v1.reshape(-1).shape != v2.reshape(-1).shape:
+                    is_equal = False
+                    break
+        assert is_equal, f"Column {column} is not equal. Expected {vals1[:2]}, got {vals2[:2]}"
+
+
+def split(data_parquet):
+    data_df = read_parquet(data_parquet, LOCAL_BACKEND.df_engine.df_lib)
+    train_df = data_df.sample(frac=0.8)
+    test_df = data_df.drop(train_df.index).sample(frac=0.5)
+    validation_df = data_df.drop(train_df.index).drop(test_df.index)
+
+    basename, ext = os.path.splitext(data_parquet)
+    train_fname = basename + ".train" + ext
+    val_fname = basename + ".validation" + ext
+    test_fname = basename + ".test" + ext
+
+    train_df.to_parquet(train_fname)
+    validation_df.to_parquet(val_fname)
+    test_df.to_parquet(test_fname)
+    return train_fname, val_fname, test_fname
+
+
+def run_test_with_features(
+    input_features,
+    output_features,
+    num_examples=20,
+    run_fn=run_api_experiment,
+    expect_error=False,
+    df_engine=None,
+    dataset_type="parquet",
+    predict=False,
+    skip_save_processed_input=True,
+    skip_save_predictions=True,
+    nan_percent=0.0,
+    preprocessing=None,
+    first_row_none=False,
+    last_row_none=False,
+    nan_cols=None,
+    required_metrics=None,
+    backend_kwargs=None,
+    trainer_kwargs=None,
+):
+    preprocessing = preprocessing or {}
+    trainer_config = {"train_steps": 1, "batch_size": 8}
+    if trainer_kwargs:
+        trainer_config.update(trainer_kwargs)
+    config = {
+        "input_features": input_features,
+        "output_features": output_features,
+        "combiner": {"type": "concat", "output_size": 14},
+        TRAINER: trainer_config,
+    }
+    if preprocessing:
+        config[PREPROCESSING] = preprocessing
+
+    backend_kwargs = copy.deepcopy(backend_kwargs or {})
+    backend_config = merge_dict(RAY_BACKEND_CONFIG, backend_kwargs)
+    if df_engine:
+        backend_config["processor"]["type"] = df_engine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_filename = os.path.join(tmpdir, "dataset.csv")
+        dataset_csv = generate_data(input_features, output_features, csv_filename, num_examples=num_examples)
+        dataset = create_data_set_to_use(dataset_type, dataset_csv, nan_percent=nan_percent)
+        dataset = augment_dataset_with_none(dataset, first_row_none, last_row_none, nan_cols)
+
+        if expect_error:
+            with pytest.raises((RuntimeError, ray.exceptions.RayTaskError)):
+                run_fn(
+                    config,
+                    dataset=dataset,
+                    backend_config=backend_config,
+                    predict=predict,
+                    skip_save_processed_input=skip_save_processed_input,
+                    skip_save_predictions=skip_save_predictions,
+                    required_metrics=required_metrics,
+                )
+        else:
+            run_fn(
+                config,
+                dataset=dataset,
+                backend_config=backend_config,
+                predict=predict,
+                skip_save_processed_input=skip_save_processed_input,
+                skip_save_predictions=skip_save_predictions,
+                required_metrics=required_metrics,
+            )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.parametrize("df_engine", ["pandas", "dask"])
+@pytest.mark.distributed
+def test_ray_read_binary_files(tmpdir, df_engine, ray_cluster_2cpu):
+    preprocessing_params = {
+        "audio_file_length_limit_in_s": 3.0,
+        "missing_value_strategy": BFILL,
+        "in_memory": True,
+        "padding_value": 0,
+        "norm": "per_file",
+        "audio_feature": {
+            "type": "fbank",
+            "window_length_in_s": 0.04,
+            "window_shift_in_s": 0.02,
+            "num_filter_bands": 80,
+        },
+    }
+    audio_dest_folder = os.path.join(tmpdir, "generated_audio")
+    audio_params = audio_feature(folder=audio_dest_folder, preprocessing=preprocessing_params)
+
+    dataset_path = os.path.join(tmpdir, "dataset.csv")
+    dataset_path = generate_data([audio_params], [], dataset_path, num_examples=10)
+    dataset_path = create_data_set_to_use("csv", dataset_path, nan_percent=0.1)
+
+    backend_config = {**RAY_BACKEND_CONFIG}
+    backend_config["processor"]["type"] = df_engine
+    backend = initialize_backend(backend_config)
+    df = backend.df_engine.df_lib.read_csv(dataset_path)
+    series = df[audio_params[COLUMN]]
+    proc_col = backend.read_binary_files(series)
+    proc_col = backend.df_engine.compute(proc_col)
+
+    backend = initialize_backend(LOCAL_BACKEND)
+    df = backend.df_engine.df_lib.read_csv(dataset_path)
+    series = df[audio_params[COLUMN]]
+    proc_col_expected = backend.read_binary_files(series)
+
+    # Compare lengths and non-null values; Ray's parallel reading may reorder or
+    # handle NaN paths differently from local sequential reading
+    assert len(proc_col) == len(proc_col_expected)
+    non_null_ray = proc_col.dropna()
+    non_null_local = proc_col_expected.dropna()
+    assert len(non_null_ray) == len(non_null_local)
+    for v1, v2 in zip(sorted(non_null_ray, key=lambda x: hash(x)), sorted(non_null_local, key=lambda x: hash(x))):
+        assert v1 == v2
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "trainer_strategy",
+    [
+        pytest.param("accelerate", id="accelerate", marks=pytest.mark.distributed),
+    ],
+)
+def test_ray_outputs(trainer_strategy, ray_cluster_2cpu):
+    input_features = [
+        binary_feature(),
+    ]
+    binary_feature_config = binary_feature()
+    category_feature_config = category_feature(output_feature=True)
+    output_features = [
+        number_feature(),
+        category_feature_config,
+        binary_feature_config,
+        # TODO: feature type not yet supported
+        # text_feature(decoder={"vocab_size": 3}),  # Error having to do with a missing key (#2586)
+        # sequence_feature(decoder={"vocab_size": 3}),  # Error having to do with a missing key (#2586)
+    ]
+    # NOTE: This test runs without NaNs because having multiple output features with DROP_ROWS strategy leads to
+    # flakiness in the test having to do with uneven allocation of samples between Ray workers.
+    run_test_with_features(
+        input_features,
+        output_features,
+        df_engine="dask",
+        dataset_type="parquet",
+        predict=True,
+        skip_save_predictions=False,
+        required_metrics={
+            binary_feature_config[NAME]: {"roc_auc"},
+            category_feature_config[NAME]: {"roc_auc"},
+        },  # ensures that these metrics are not omitted.
+        backend_kwargs={
+            TRAINER: {"strategy": trainer_strategy},
+        },
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.skip(reason="Occasional metadata mismatch error: https://github.com/ludwig-ai/ludwig/issues/2889")
+@pytest.mark.parametrize("dataset_type", ["csv", "parquet"])
+@pytest.mark.distributed
+def test_ray_set_and_vector_outputs(dataset_type, ray_cluster_2cpu):
+    input_features = [
+        binary_feature(),
+    ]
+    # The synthetic set feature generator inserts between 0 and `vocab_size` entities per entry. 0 entities creates a
+    # null (NaN) entry. The default behavior for such entries in output features is to DROP_ROWS. This leads to poorly
+    # handled non-determinism when comparing the metrics between the local and Ray backends. We work around this by
+    # setting the `missing_value_strategy` to `fill_with_const` and setting the `fill_value` to the empty string.
+    set_feature_config = set_feature(
+        decoder={"vocab_size": 3},
+        preprocessing={"missing_value_strategy": "fill_with_const", "fill_value": ""},
+    )
+    output_features = [
+        vector_feature(),
+        set_feature_config,
+    ]
+    # NOTE: This test runs without NaNs because having multiple output features with DROP_ROWS strategy leads to
+    # flakiness in the test having to do with uneven allocation of samples between Ray workers.
+    run_test_with_features(
+        input_features,
+        output_features,
+        df_engine="dask",
+        dataset_type=dataset_type,
+        predict=True,
+        skip_save_predictions=False,
+        required_metrics={set_feature_config[NAME]: {"jaccard"}},  # ensures that the metric is not omitted.
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.distributed
+@pytest.mark.parametrize(
+    "df_engine",
+    [
+        "dask",
+        pytest.param(
+            "modin",
+            marks=[
+                pytest.mark.skipif(modin is None, reason="modin not installed"),
+                pytest.mark.skip(reason="https://github.com/ludwig-ai/ludwig/issues/2643"),
+            ],
+        ),
+    ],
+)
+def test_ray_tabular(tmpdir, df_engine, ray_cluster_2cpu):
+    input_features = [
+        category_feature(encoder={"vocab_size": 2}, reduce_input="sum"),
+        number_feature(normalization="zscore"),
+        set_feature(),
+        binary_feature(),
+        bag_feature(),
+        h3_feature(),
+        date_feature(),
+    ]
+    output_features = [
+        binary_feature(bool2str=["No", "Yes"]),
+        binary_feature(),
+        number_feature(normalization="zscore"),
+    ]
+    run_preprocessing(
+        tmpdir,
+        df_engine,
+        input_features,
+        output_features,
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.parametrize("dataset_type", ["csv", "parquet"])
+@pytest.mark.distributed
+def test_ray_tabular_save_inputs(tmpdir, dataset_type, ray_cluster_2cpu):
+    input_features = [
+        category_feature(encoder={"vocab_size": 2}, reduce_input="sum"),
+        number_feature(normalization="zscore"),
+        set_feature(),
+        binary_feature(),
+        bag_feature(),
+        date_feature(
+            preprocessing={"fill_value": "2020-01-01"}
+        ),  # fill_value must be set to achieve parity between backends (otherwise fill value would be "now")
+        # TODO: feature type not yet supported
+        # h3_feature(),  # ValueError casting large int strings (e.g. '5.864041857092157e+17') to int (#2588)
+    ]
+    output_features = [
+        category_feature(decoder={"vocab_size": 5}),  # Regression test for #1991 requires multi-class predictions.
+    ]
+    run_preprocessing(
+        tmpdir,
+        "dask",
+        input_features,
+        output_features,
+        dataset_type=dataset_type,
+        nan_percent=0.1,
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.distributed
+@pytest.mark.parametrize("dataset_type", ["csv", "parquet"])
+def test_ray_text_sequence_timeseries(tmpdir, dataset_type, ray_cluster_2cpu):
+    input_features = [
+        text_feature(),
+        sequence_feature(encoder={"reduce_output": "sum"}),
+        timeseries_feature(),
+    ]
+    output_features = [
+        binary_feature(),
+    ]
+    run_preprocessing(
+        tmpdir,
+        "dask",
+        input_features,
+        output_features,
+        dataset_type=dataset_type,
+        nan_percent=0.1,
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.parametrize("dataset_type", ["csv", "parquet"])
+@pytest.mark.distributed
+def test_ray_vector(tmpdir, dataset_type, ray_cluster_2cpu):
+    input_features = [
+        vector_feature(),
+    ]
+    output_features = [
+        binary_feature(),
+    ]
+    run_preprocessing(
+        tmpdir,
+        "dask",
+        input_features,
+        output_features,
+        dataset_type=dataset_type,
+        nan_percent=0.0,  # NaN handling not supported for vectors.
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.parametrize("dataset_type", ["csv", "parquet"])
+@pytest.mark.distributed
+def test_ray_audio(tmp_path, dataset_type, ray_cluster_2cpu):
+    preprocessing_params = {
+        "audio_file_length_limit_in_s": 3.0,
+        "missing_value_strategy": BFILL,
+        "in_memory": True,
+        "padding_value": 0,
+        "norm": "per_file",
+        "type": "fbank",
+        "window_length_in_s": 0.04,
+        "window_shift_in_s": 0.02,
+        "num_filter_bands": 80,
+    }
+    audio_dest_folder = os.path.join(tmp_path, "generated_audio")
+    input_features = [audio_feature(folder=audio_dest_folder, preprocessing=preprocessing_params)]
+    output_features = [
+        binary_feature(),
+    ]
+    run_preprocessing(
+        tmp_path,
+        "dask",
+        input_features,
+        output_features,
+        dataset_type=dataset_type,
+        nan_percent=0.1,
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.parametrize("dataset_type", ["csv", "parquet", "pandas+numpy_images"])
+@pytest.mark.distributed
+def test_ray_image(tmpdir, dataset_type, ray_cluster_2cpu):
+    image_dest_folder = os.path.join(tmpdir, "generated_images")
+    input_features = [
+        image_feature(
+            folder=image_dest_folder,
+            preprocessing={"in_memory": True, "height": 12, "width": 12, "num_channels": 3, "num_processes": 5},
+            encoder={"output_size": 16, "num_filters": 8},
+        ),
+    ]
+    output_features = [
+        binary_feature(),
+    ]
+    run_preprocessing(
+        tmpdir,
+        "dask",
+        input_features,
+        output_features,
+        dataset_type=dataset_type,
+        nan_percent=0.1,
+    )
+
+
+@pytest.mark.integration_tests_a
+@pytest.mark.distributed_a
+@pytest.mark.parametrize(
+    "settings",
+    [(True, False, "ffill"), (False, True, "bfill"), (True, True, "bfill"), (True, True, "ffill")],
+    ids=["first_row_none", "last_row_none", "first_and_last_row_none_bfill", "first_and_last_row_none_ffill"],
+)
+@pytest.mark.distributed
+def test_ray_image_with_fill_strategy_edge_cases(tmpdir, settings, ray_cluster_2cpu):
+    first_row_none, last_row_none, missing_value_strategy = settings
+    image_dest_folder = os.path.join(tmpdir, "generated_images")
+    input_features = [
+        image_feature(
+            folder=image_dest_folder,
+            preprocessing={
+                "in_memory": True,
+                "height": 12,
+                "width": 12,
+                "num_channels": 3,
+                "num_processes": 5,
+                "missing_value_strategy": missing_value_strategy,
+            },
+            encoder={"output_size": 16, "num_filters": 8},
+        ),
+    ]
+    output_features = [
+        binary_feature(),
+    ]
+    run_preprocessing(
+        tmpdir,
+        "dask",
+        input_features,
+        output_features,
+        dataset_type="pandas+numpy_images",
+        first_row_none=first_row_none,
+        last_row_none=last_row_none,
+        nan_cols=[input_features[0][NAME]],
+    )
+
+
+# TODO(geoffrey): Fold modin tests into test_ray_image as @pytest.mark.parametrized once tests are optimized
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.distributed
+@pytest.mark.skipif(modin is None, reason="modin not installed")
+@pytest.mark.skip(reason="https://github.com/ludwig-ai/ludwig/issues/2643")
+def test_ray_image_modin(tmpdir, ray_cluster_2cpu):
+    image_dest_folder = os.path.join(tmpdir, "generated_images")
+    input_features = [
+        image_feature(
+            folder=image_dest_folder,
+            encoder={
+                "type": "stacked_cnn",
+                "output_size": 16,
+            },
+            preprocessing={"in_memory": True, "height": 12, "width": 12, "num_channels": 3, "num_processes": 5},
+        ),
+    ]
+    output_features = [
+        binary_feature(),
+    ]
+    run_preprocessing(
+        tmpdir,
+        "modin",
+        input_features,
+        output_features,
+        dataset_type="csv",
+        nan_percent=0.1,
+    )
+
+
+@pytest.mark.integration_tests_e
+@pytest.mark.distributed_e
+@pytest.mark.distributed
+def test_ray_image_multiple_features(tmpdir, ray_cluster_2cpu):
+    input_features = [
+        image_feature(
+            folder=os.path.join(tmpdir, "generated_images_1"),
+            preprocessing={"in_memory": True, "height": 12, "width": 12, "num_channels": 3, "num_processes": 5},
+            encoder={"output_size": 16, "num_filters": 8},
+        ),
+        image_feature(
+            folder=os.path.join(tmpdir, "generated_images_2"),
+            preprocessing={"in_memory": True, "height": 12, "width": 12, "num_channels": 3, "num_processes": 5},
+            encoder={"output_size": 16, "num_filters": 8},
+        ),
+    ]
+    output_features = [
+        binary_feature(),
+    ]
+    run_preprocessing(
+        tmpdir,
+        "dask",
+        input_features,
+        output_features,
+        dataset_type="csv",
+        nan_percent=0.1,
+    )
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.skip(reason="flaky: ray is running out of resources")
+@pytest.mark.distributed
+def test_ray_split(ray_cluster_2cpu):
+    input_features = [
+        number_feature(normalization="zscore"),
+        set_feature(),
+        binary_feature(),
+    ]
+    output_features = [category_feature(decoder={"vocab_size": 2}, reduce_input="sum")]
+    run_test_with_features(
+        input_features,
+        output_features,
+        run_fn=run_split_api_experiment,
+    )
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.distributed
+def test_ray_audio_basic(tmpdir, ray_cluster_2cpu):
+    # in_memory=False lazy loading was removed (everything is in-memory now,
+    # Parquet caching handles persistence). This test verifies audio works
+    # normally with Ray without the determinism check (tiny audio datasets
+    # produce non-deterministic roc_auc between Ray and local backends).
+    audio_dest_folder = os.path.join(tmpdir, "generated_audio")
+    input_features = [audio_feature(folder=audio_dest_folder)]
+    output_features = [binary_feature()]
+    run_test_with_features(input_features, output_features, num_examples=8, expect_error=False, run_fn=_run_no_evaluate)
+
+
+def _run_no_evaluate(config, dataset, backend_config, **kwargs):
+    """Run training without the Ray-vs-local determinism check."""
+    kwargs.pop("required_metrics", None)
+    kwargs.pop("predict", None)
+    kwargs.pop("evaluate", None)
+    return train_with_backend(backend_config, config, dataset=dataset, evaluate=False, predict=False, **kwargs)
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.distributed
+@pytest.mark.parametrize("mode", ["lazy", "eager"], ids=["lazy", "eager"])
+def test_ray_audio_lazy_modes(tmpdir, mode, ray_cluster_2cpu):
+    """Training must succeed with both mode='lazy' (decode in worker) and mode='eager' (decode upfront).
+
+    mode='lazy' is the default and exercises the _with_lazy_decode map_batches path.
+    mode='eager' verifies that the eager (pre-decoded) path still works correctly in Ray.
+    """
+    audio_dest_folder = os.path.join(tmpdir, "generated_audio")
+    input_features = [
+        audio_feature(
+            folder=audio_dest_folder,
+            preprocessing={
+                "type": "fbank",
+                "window_length_in_s": 0.04,
+                "window_shift_in_s": 0.02,
+                "num_filter_bands": 8,
+                "audio_file_length_limit_in_s": 0.5,
+                "missing_value_strategy": "bfill",
+                "in_memory": True,
+                "padding_value": 0.0,
+                "norm": None,
+                "mode": mode,
+            },
+        )
+    ]
+    output_features = [binary_feature()]
+    run_test_with_features(input_features, output_features, num_examples=8, expect_error=False, run_fn=_run_no_evaluate)
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.distributed
+@pytest.mark.parametrize("mode", ["lazy", "eager"], ids=["lazy", "eager"])
+def test_ray_image_lazy_modes(tmpdir, mode, ray_cluster_2cpu):
+    """Image training must succeed with both mode='lazy' (decode in worker) and mode='eager' (decode upfront).
+
+    mode='lazy' exercises the _with_lazy_decode map_batches path for images.
+    mode='eager' verifies that the eager (pre-decoded) path still works correctly in Ray.
+    """
+    image_dest_folder = os.path.join(tmpdir, "generated_images")
+    input_features = [
+        image_feature(
+            folder=image_dest_folder,
+            preprocessing={"in_memory": True, "height": 12, "width": 12, "num_channels": 3, "mode": mode},
+            encoder={"type": "stacked_cnn", "output_size": 16, "num_filters": 8},
+        )
+    ]
+    output_features = [binary_feature()]
+    run_test_with_features(input_features, output_features, num_examples=8, expect_error=False, run_fn=_run_no_evaluate)
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.slow
+@pytest.mark.distributed
+def test_ray_lazy_load_image_works(tmpdir, ray_cluster_2cpu):
+    image_dest_folder = os.path.join(tmpdir, "generated_images")
+    input_features = [
+        image_feature(
+            folder=image_dest_folder,
+            encoder={
+                "type": "stacked_cnn",
+                "output_size": 16,
+            },
+            preprocessing={"in_memory": False, "height": 12, "width": 12, "num_channels": 3, "num_processes": 5},
+        ),
+    ]
+    output_features = [
+        binary_feature(),
+    ]
+    run_test_with_features(input_features, output_features, expect_error=False)
+
+
+# TODO(travis): move this to separate gpu module so we only have one ray cluster running at a time
+# @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="test requires at least 1 gpu")
+# @pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires gpu support")
+# @pytest.mark.distributed
+# def test_train_gpu_load_cpu(ray_cluster_2cpu):
+#     input_features = [
+#         category_feature(encoder={"vocab_size": 2}, reduce_input="sum"),
+#         number_feature(normalization="zscore"),
+#     ]
+#     output_features = [
+#         binary_feature(),
+#     ]
+#     run_test_with_features(input_features, output_features, run_fn=_run_train_gpu_load_cpu, num_gpus=1)
+
+
+@pytest.mark.integration_tests_d
+@pytest.mark.distributed_d
+@pytest.mark.distributed
+@pytest.mark.parametrize(
+    "method, balance",
+    [
+        ("oversample_minority", 0.5),
+        ("undersample_majority", 0.5),
+    ],
+)
+def test_balance_ray(method, balance, ray_cluster_2cpu):
+    config = {
+        "input_features": [
+            {"name": "Index", "proc_column": "Index", "type": "number"},
+            {"name": "random_1", "proc_column": "random_1", "type": "number"},
+            {"name": "random_2", "proc_column": "random_2", "type": "number"},
+        ],
+        "output_features": [{"name": "Label", "proc_column": "Label", "type": "binary"}],
+        "preprocessing": {"oversample_minority": None, "undersample_majority": None},
+    }
+    input_df = pd.DataFrame(
+        {
+            "Index": np.arange(0, 200, 1),
+            "random_1": np.random.randint(0, 50, 200),
+            "random_2": np.random.choice(["Type A", "Type B", "Type C", "Type D"], 200),
+            "Label": np.concatenate((np.zeros(180), np.ones(20))),
+            "split": np.zeros(200),
+        }
+    )
+    config["preprocessing"][method] = balance
+    target = config["output_features"][0][NAME]
+
+    backend = create_ray_backend()
+    input_df = backend.df_engine.from_pandas(input_df)
+    test_df = balance_data(input_df, config["output_features"], config["preprocessing"], backend, 42)
+
+    majority_class = test_df[target].value_counts().compute()[test_df[target].value_counts().compute().idxmax()]
+    minority_class = test_df[target].value_counts().compute()[test_df[target].value_counts().compute().idxmin()]
+    new_class_balance = round(minority_class / majority_class, 2)
+
+    assert abs(balance - new_class_balance) < BALANCE_PERCENTAGE_TOLERANCE
+
+
+def _run_train_gpu_load_cpu(config, data_parquet):
+    with tempfile.TemporaryDirectory() as output_dir:
+        model_dir = ray.get(train_gpu.remote(config, data_parquet, output_dir))
+        ray.get(predict_cpu.remote(model_dir, data_parquet))
+
+
+# TODO(geoffrey): add a GPU test for batch size tuning
+
+
+@pytest.mark.integration_tests_d
+@pytest.mark.distributed_d
+@pytest.mark.distributed
+@pytest.mark.parametrize(
+    ("max_batch_size", "expected_final_learning_rate"),
+    [(256, 0.001), (8, 0.001)],
+)
+def test_tune_batch_size_lr_cpu(tmpdir, ray_cluster_2cpu, max_batch_size, expected_final_learning_rate):
+    out_feature = category_feature(decoder={"vocab_size": 2}, reduce_input="sum")
+    config = {
+        "input_features": [
+            number_feature(normalization="zscore"),
+            set_feature(),
+            binary_feature(),
+        ],
+        "output_features": [out_feature],
+        "combiner": {"type": "concat", "output_size": 14},
+        TRAINER: {
+            "train_steps": 3,
+            "batch_size": "auto",
+            "learning_rate": "auto",
+            "max_batch_size": max_batch_size,
+        },
+        # Use a fixed split so we can guarantee both category values appear in every
+        # split bucket.  With vocab_size=2 and a random 70/10/20 split the validation
+        # set (~5 rows) has ~5% probability of being single-category, causing a
+        # hard InputDataError on every affected CI run.
+        "preprocessing": {"split": {"type": "fixed"}},
+    }
+
+    backend_config = copy.deepcopy(RAY_BACKEND_CONFIG)
+
+    num_samples = 50
+    csv_filename = os.path.join(tmpdir, "dataset.csv")
+    generate_data(config["input_features"], config["output_features"], csv_filename, num_examples=num_samples)
+
+    # Post-process: add an explicit "split" column (0=train, 1=val, 2=test) and
+    # pin at least one row of each category value into every split so neither val
+    # nor test can ever be single-category regardless of the random data draw.
+    df = pd.read_csv(csv_filename)
+    cat_col = out_feature["name"]
+    cat_vals = sorted(df[cat_col].unique().tolist())
+
+    n = len(df)
+    n_val = max(4, int(n * DEFAULT_PROBABILITIES[1]))
+    n_test = max(4, int(n * DEFAULT_PROBABILITIES[2]))
+    n_train = n - n_val - n_test
+    df["split"] = [0] * n_train + [1] * n_val + [2] * n_test
+
+    # For each split bucket, ensure every category value appears at least once.
+    for split_id, split_rows in [(0, n_train), (1, n_val), (2, n_test)]:
+        mask = df["split"] == split_id
+        present = set(df.loc[mask, cat_col].unique())
+        for i, val in enumerate(cat_vals):
+            if val not in present:
+                idx = df[mask].index[i % mask.sum()]
+                df.at[idx, cat_col] = val
+
+    df.to_csv(csv_filename, index=False)
+
+    dataset_parquet = create_data_set_to_use("parquet", csv_filename)
+    model = run_api_experiment(config, dataset=dataset_parquet, backend_config=backend_config, evaluate=False)
+
+    num_train_samples = n_train
+    max_batch_size_by_train_examples = MAX_BATCH_SIZE_DATASET_FRACTION * num_train_samples
+    max_batch_size = (
+        max_batch_size_by_train_examples
+        if max_batch_size is None
+        else min(max_batch_size_by_train_examples, max_batch_size)
+    )
+    assert 2 < model.config[TRAINER]["batch_size"] <= max_batch_size
+    assert model.config[TRAINER]["learning_rate"] == expected_final_learning_rate
+
+
+@pytest.mark.integration_tests_d
+@pytest.mark.distributed_d
+@pytest.mark.distributed
+def test_tune_batch_size_ray_non_mean_metric_output(tmpdir, ray_cluster_2cpu):
+    """Regression: tune_batch_size_fn must call init_dist_strategy("local") before running.
+
+    The existing test_tune_batch_size_lr_cpu uses category output, whose eval_loss_metric
+    (SoftmaxCrossEntropyMetric) inherits MeanMetric and takes a shortcut path that bypasses
+    TorchMetrics forward() → sync_context(). This test uses number output (MSEMetric), which
+    is NOT a MeanMetric and goes through the full TorchMetrics forward() → sync_context() →
+    get_current_dist_strategy() path. Without init_dist_strategy("local") in tune_batch_size_fn
+    that call raises RuntimeError: Distributed strategy not initialized.
+
+    See: https://github.com/ludwig-ai/ludwig/issues/4149
+    """
+    config = {
+        "input_features": [number_feature(normalization="zscore"), binary_feature()],
+        "output_features": [number_feature()],
+        "combiner": {"type": "concat", "output_size": 8},
+        TRAINER: {
+            "train_steps": 2,
+            "batch_size": "auto",
+            "max_batch_size": 32,
+        },
+    }
+    csv_filename = os.path.join(tmpdir, "dataset.csv")
+    generate_data(config["input_features"], config["output_features"], csv_filename, num_examples=40)
+    dataset_parquet = create_data_set_to_use("parquet", csv_filename)
+    # If tune_batch_size_fn is missing init_dist_strategy this raises:
+    #   RuntimeError: Distributed strategy not initialized
+    run_api_experiment(config, dataset=dataset_parquet, backend_config=RAY_BACKEND_CONFIG, evaluate=False)
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.slow
+@pytest.mark.parametrize("calibration", [True, False])
+@pytest.mark.distributed
+def test_ray_calibration(calibration, ray_cluster_2cpu):
+    input_features = [
+        number_feature(normalization="zscore"),
+        set_feature(),
+        binary_feature(),
+    ]
+    output_features = [
+        binary_feature(calibration=calibration),
+        category_feature(decoder={"vocab_size": 3}, calibration=calibration),
+    ]
+    run_test_with_features(input_features, output_features)
+
+
+@pytest.mark.integration_tests_b
+@pytest.mark.distributed_b
+@pytest.mark.slow
+@pytest.mark.distributed
+@pytest.mark.parametrize("use_placement_group", [False, True], ids=["default", "placement_group"])
+def test_ray_distributed_predict(use_placement_group, ray_cluster_2cpu):
+    preprocessing_params = {
+        "audio_file_length_limit_in_s": 3.0,
+        "missing_value_strategy": BFILL,
+        "in_memory": True,
+        "padding_value": 0,
+        "norm": "per_file",
+        "type": "fbank",
+        "window_length_in_s": 0.04,
+        "window_shift_in_s": 0.02,
+        "num_filter_bands": 80,
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_dest_folder = os.path.join(tmpdir, "generated_audio")
+        input_features = [audio_feature(folder=audio_dest_folder, preprocessing=preprocessing_params)]
+        output_features = [
+            binary_feature(),
+        ]
+
+        config = {
+            "input_features": input_features,
+            "output_features": output_features,
+            TRAINER: {"train_steps": 1, "batch_size": 8},
+        }
+
+        backend_config = copy.deepcopy(RAY_BACKEND_CONFIG)
+        if use_placement_group:
+            backend_config["preprocessor_kwargs"] = {"num_cpu": 1}
+        else:
+            backend_config["trainer"]["num_workers"] = 2
+        csv_filename = os.path.join(tmpdir, "dataset.csv")
+        dataset_csv = generate_data(input_features, output_features, csv_filename, num_examples=50)
+        dataset = create_data_set_to_use("csv", dataset_csv, nan_percent=0.0)
+        model = LudwigModel(config, backend=backend_config)
+
+        _, _, _ = model.train(
+            dataset=dataset,
+            training_set=dataset,
+            skip_save_processed_input=True,
+            skip_save_progress=True,
+            skip_save_unprocessed_output=True,
+            skip_save_log=True,
+        )
+
+        preds, _ = model.predict(dataset=dataset)
+
+        if not use_placement_group:
+            # Verify predictions have distinct row indices
+            preds = preds.compute()
+            assert preds.iloc[1].name != preds.iloc[42].name

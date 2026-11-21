@@ -1,0 +1,397 @@
+#! /usr/bin/env python
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
+
+from ludwig.constants import TRAINING
+from ludwig.data.batcher.base import Batcher
+from ludwig.data.batcher.random_access import RandomAccessBatcher
+from ludwig.data.dataset.base import Dataset, DatasetManager
+from ludwig.data.sampler import DistributedSampler
+from ludwig.distributed import DistributedStrategy
+from ludwig.features.base_feature import BaseFeature
+from ludwig.utils.dataframe_utils import from_numpy_dataset, to_numpy_dataset, to_scalar_df
+from ludwig.utils.defaults import default_random_seed
+from ludwig.utils.misc_utils import get_proc_features
+
+if TYPE_CHECKING:
+    from ludwig.backend.base import Backend
+
+logger = logging.getLogger(__name__)
+
+# Key for storing the path to the training Parquet cache in metadata
+DATA_TRAIN_PARQUET_FP = "data_train_parquet_fp"
+
+# Legacy key -- kept for backward-compat loading of old caches
+DATA_TRAIN_HDF5_FP = "data_train_hdf5_fp"
+
+
+def _shapes_path(data_fp):
+    """Return the path to the column-shapes sidecar JSON file for a given Parquet cache file."""
+    return os.path.splitext(data_fp)[0] + ".shapes.json"
+
+
+def _save_parquet(data_fp, data):
+    """Save a preprocessed dataset (dict of numpy arrays) to Parquet.
+
+    Multi-dimensional columns (e.g. images with shape [H, W, C]) are flattened to 1-D
+    before writing because Parquet cannot natively represent N-D arrays inside cells.
+    The original shapes are persisted in a sidecar JSON file so that ``_load_parquet``
+    can restore them.
+    """
+    from ludwig.utils.data_utils import save_json
+
+    dataset = data if isinstance(data, dict) else to_numpy_dataset(data)
+
+    column_shapes: dict[str, list[int]] = {}
+    flat_dataset: dict[str, np.ndarray] = {}
+    for col, arr in dataset.items():
+        arr = np.asarray(arr)
+        if arr.ndim > 2:
+            # Record the per-sample shape (everything after the batch dimension)
+            column_shapes[col] = list(arr.shape[1:])
+            # Flatten each sample to 1-D so Parquet can store it
+            flat_dataset[col] = arr.reshape(arr.shape[0], -1)
+        else:
+            flat_dataset[col] = arr
+
+    df = from_numpy_dataset(flat_dataset)
+    df.to_parquet(data_fp, engine="pyarrow", index=False)
+
+    # Persist shapes sidecar (even if empty, so _load_parquet can always read it)
+    save_json(_shapes_path(data_fp), column_shapes)
+
+
+def _load_parquet(data_fp):
+    """Load a preprocessed dataset from Parquet, returning a dict of numpy arrays.
+
+    If a sidecar ``*.shapes.json`` file exists alongside the Parquet file the
+    recorded shapes are used to restore multi-dimensional columns.
+    """
+    from ludwig.utils.data_utils import load_json
+
+    df = pd.read_parquet(data_fp, engine="pyarrow")
+    dataset = to_numpy_dataset(df)
+
+    # Restore N-D shapes if available
+    shapes_fp = _shapes_path(data_fp)
+    if os.path.exists(shapes_fp):
+        column_shapes = load_json(shapes_fp)
+        for col, shape in column_shapes.items():
+            if col in dataset:
+                arr = dataset[col]
+                dataset[col] = arr.reshape(arr.shape[0], *shape)
+
+    return dataset
+
+
+def _load_dataset(dataset):
+    """Load a dataset from a file path (Parquet or legacy HDF5) or return as-is if already in-memory."""
+    if isinstance(dataset, str):
+        if dataset.endswith(".parquet"):
+            return _load_parquet(dataset)
+        elif dataset.endswith(".hdf5") or dataset.endswith(".h5"):
+            # Legacy HDF5 loading for backward compatibility
+            from ludwig.utils.data_utils import load_hdf5
+
+            logger.info(f"Loading legacy HDF5 cache: {dataset}. Consider re-preprocessing to use Parquet.")
+            return to_numpy_dataset(load_hdf5(dataset))
+        else:
+            raise ValueError(f"Unsupported cache format: {dataset}. Expected .parquet or .hdf5")
+    return dataset
+
+
+class PandasDataset(Dataset):
+    def __init__(self, dataset, features, data_cache_fp, training_set_metadata=None):
+        self.features = features
+        self.data_cache_fp = data_cache_fp
+
+        dataset = _load_dataset(dataset)
+        self.dataset = to_numpy_dataset(dataset)
+
+        # Restore N-D shapes for columns that were flattened for Parquet compatibility
+        # (e.g. images [H,W,C] stored as flat 1-D arrays).
+        # Lazy columns (audio/image stored as path strings) are skipped here because
+        # their reshape is set to None in the metadata.
+        if training_set_metadata is not None:
+            for feature_name, feature_meta in training_set_metadata.items():
+                if not isinstance(feature_meta, dict):
+                    continue
+                reshape = feature_meta.get("reshape")
+                if reshape is None:
+                    continue
+                # Find the proc_column for this feature
+                for proc_col, feat_cfg in features.items():
+                    if feat_cfg.get("name") == feature_name or feat_cfg.get("column") == feature_name:
+                        if proc_col in self.dataset:
+                            arr = self.dataset[proc_col]
+                            # Skip object-dtype columns (path strings for lazy features)
+                            if arr.dtype == object:
+                                break
+                            expected_shape = (arr.shape[0], *reshape)
+                            if arr.shape != expected_shape and np.prod(arr.shape[1:]) == np.prod(reshape):
+                                self.dataset[proc_col] = arr.reshape(expected_shape)
+                        break
+
+        # Reconstruct LazyColumn objects for lazy media features (audio / image).
+        # During preprocessing, lazy features stored file paths as strings.  Here
+        # we wrap those path arrays with the appropriate per-sample decode function
+        # so that batches are decoded on demand rather than all at once.
+        self._auto_prefetch_size = 0
+        if training_set_metadata is not None:
+            self._init_lazy_columns(features, training_set_metadata)
+
+        self.size = len(list(self.dataset.values())[0])
+
+    def _decoded_cache_path(self, proc_col: str, n: int, sample_shape: tuple) -> str:
+        """Return the path for the decoded numpy memmap file for a given column.
+
+        Placed next to the Parquet cache when ``data_cache_fp`` is set, otherwise
+        falls back to ``~/.cache/ludwig/lazy_media/``.
+        """
+        flat_shape = "_".join(str(d) for d in sample_shape)
+        fname = f"{proc_col}_decoded_n{n}_{flat_shape}_f32.npy"
+        if self.data_cache_fp:
+            return os.path.join(os.path.dirname(self.data_cache_fp), fname)
+        from ludwig.data.lazy_utils import get_default_lazy_cache_dir
+
+        return str(get_default_lazy_cache_dir() / fname)
+
+    def _init_lazy_columns(self, features: dict, training_set_metadata: dict) -> None:
+        """Replace string-path arrays for lazy features with LazyColumn or CachedLazyColumn objects."""
+        from ludwig.data.lazy_utils import CachedLazyColumn, LazyColumn
+
+        max_prefetch = 0
+
+        for proc_col, feat_cfg in features.items():
+            if proc_col not in self.dataset:
+                continue
+            feature_name = feat_cfg.get("name") or feat_cfg.get("column") or proc_col
+            feat_meta = training_set_metadata.get(feature_name, {})
+            if not isinstance(feat_meta, dict) or not feat_meta.get("lazy"):
+                continue
+
+            paths = self.dataset[proc_col]
+            feat_type = feat_cfg.get("type", "")
+            mode = feat_meta.get("mode", "lazy")
+            # Per-feature prefetch override (None means auto → 4 for lazy modes)
+            feat_prefetch = feat_meta.get("prefetch_size")
+            effective_prefetch = feat_prefetch if feat_prefetch is not None else 4
+            max_prefetch = max(max_prefetch, effective_prefetch)
+
+            if feat_type == "audio" and "lazy_audio_params" in feat_meta:
+                from ludwig.features.audio_feature import AudioFeatureMixin
+
+                p = feat_meta["lazy_audio_params"]
+                decode_fn = AudioFeatureMixin._make_lazy_decode_fn(
+                    audio_feature_dict=p["audio_feature_dict"],
+                    feature_dim=p["feature_dim"],
+                    max_length=p["max_length"],
+                    padding_value=p["padding_value"],
+                    normalization_type=p["normalization_type"],
+                )
+                # Audio FBANK is CPU-bound: each decode() already uses PyTorch's
+                # internal thread pool.  Over-subscribing CPUs by running many
+                # workers in parallel causes severe slowdowns (up to 5×).  Cap at
+                # cpu_count // torch_threads so total threads ≈ cpu_count.
+                import torch as _torch
+
+                _audio_workers = max(1, (os.cpu_count() or 4) // max(1, _torch.get_num_threads()))
+
+                if mode == "lazy_cached":
+                    # decode_fn returns (max_length, feature_dim) — match that order.
+                    sample_shape = (p["max_length"], p["feature_dim"])
+                    cache_path = self._decoded_cache_path(proc_col, len(paths), sample_shape)
+                    self.dataset[proc_col] = CachedLazyColumn(
+                        paths, decode_fn, cache_path, sample_shape, max_workers=_audio_workers
+                    )
+                else:
+                    self.dataset[proc_col] = LazyColumn(paths, decode_fn, max_workers=_audio_workers)
+
+            elif feat_type == "image" and "lazy_image_params" in feat_meta:
+                import torch
+
+                from ludwig.features.image_feature import ImageFeatureMixin
+
+                p = feat_meta["lazy_image_params"]
+                channel_class_map = torch.tensor(p["channel_class_map"])
+                shape = p["default_image_shape"]
+                default_image = np.zeros(shape, dtype=np.float32)
+                decode_fn = ImageFeatureMixin._make_lazy_decode_fn(
+                    img_width=p["img_width"],
+                    img_height=p["img_height"],
+                    should_resize=p["should_resize"],
+                    num_channels=p["num_channels"],
+                    resize_method=p["resize_method"],
+                    user_specified_num_channels=p["user_specified_num_channels"],
+                    standardize_image=p["standardize_image"],
+                    channel_class_map=channel_class_map,
+                    default_image=default_image,
+                )
+
+                if mode == "lazy_cached":
+                    sample_shape = tuple(p["default_image_shape"])
+                    cache_path = self._decoded_cache_path(proc_col, len(paths), sample_shape)
+                    self.dataset[proc_col] = CachedLazyColumn(paths, decode_fn, cache_path, sample_shape)
+                else:
+                    self.dataset[proc_col] = LazyColumn(paths, decode_fn)
+
+        self._auto_prefetch_size = max_prefetch
+
+    def to_df(self, features: Iterable[BaseFeature] | None = None) -> DataFrame:
+        """Convert the dataset to a Pandas DataFrame.
+
+        Lazy columns (audio / image path arrays) are excluded because they
+        contain file-path strings, not decoded tensors.  These features are
+        always input features and are never needed for postprocessing.
+        """
+        from ludwig.data.lazy_utils import is_lazy_column
+
+        if features:
+            subset = {}
+            for feature in features:
+                col = self.dataset.get(feature.proc_column)
+                if col is not None and not is_lazy_column(col):
+                    subset[feature.feature_name] = col
+            return from_numpy_dataset(subset)
+        non_lazy = {k: v for k, v in self.dataset.items() if not is_lazy_column(v)}
+        return from_numpy_dataset(non_lazy)
+
+    def to_scalar_df(self, features: Iterable[BaseFeature] | None = None) -> DataFrame:
+        return to_scalar_df(self.to_df(features))
+
+    def get(self, proc_column, idx=None):
+        if idx is None:
+            idx = range(self.size)
+        return self.dataset[proc_column][idx]
+
+    def get_dataset(self) -> dict[str, np.ndarray]:
+        return self.dataset
+
+    def __len__(self):
+        return self.size
+
+    @property
+    def processed_data_fp(self) -> str | None:
+        return self.data_cache_fp
+
+    @property
+    def in_memory_size_bytes(self) -> int:
+        # to_df() already excludes lazy columns (path strings, not arrays).
+        df = self.to_df()
+        return df.memory_usage(deep=True).sum() if df is not None else 0
+
+    def _has_lazy_columns(self) -> bool:
+        """Return True if any column in this dataset is a LazyColumn (path-array needing decode)."""
+        from ludwig.data.lazy_utils import is_lazy_column
+
+        return any(is_lazy_column(v) for v in self.dataset.values())
+
+    def is_fully_cached(self) -> bool:
+        """Return ``True`` when every ``CachedLazyColumn`` in this dataset has finished its first-pass decode.
+
+        Returns ``False`` if there are no ``CachedLazyColumn`` instances (i.e. the dataset
+        uses plain ``LazyColumn`` or eager mode).
+        """
+        from ludwig.data.lazy_utils import is_cached_lazy_column
+
+        cached_cols = [v for v in self.dataset.values() if is_cached_lazy_column(v)]
+        if not cached_cols:
+            return False
+        return all(col.is_fully_cached() for col in cached_cols)
+
+    @contextlib.contextmanager
+    def initialize_batcher(
+        self,
+        batch_size: int = 128,
+        should_shuffle: bool = True,
+        random_seed: int = default_random_seed,
+        ignore_last: bool = False,
+        distributed: DistributedStrategy = None,
+        augmentation_pipeline=None,
+        prefetch_size: int | None = None,
+    ) -> Batcher:
+        """Yield a :class:`RandomAccessBatcher` configured for this dataset.
+
+        Parameters
+        ----------
+        prefetch_size:
+            Number of batches to pipeline in a background thread while the GPU
+            processes the current batch.  ``None`` (default) uses
+            ``self._auto_prefetch_size``, which is derived from the
+            ``prefetch_size`` field in each feature's preprocessing config
+            (``None`` → 4 for ``lazy``/``lazy_cached`` features, 0 for
+            ``eager``).  Pass ``0`` to disable prefetch entirely.
+
+            For ``lazy_cached`` mode, ``RandomAccessBatcher.set_epoch`` will
+            automatically reset ``prefetch_size`` to 0 after epoch 1 once
+            ``dataset.is_fully_cached()`` returns ``True`` — memmap reads are
+            fast enough that background pipelining adds no measurable benefit.
+        """
+        # When the dataset contains lazy columns (audio / image file paths that
+        # are decoded per-batch), automatically enable prefetch so the GPU is
+        # not idle during decode.  Callers can override by passing prefetch_size
+        # explicitly (0 to disable, N to set a specific depth).
+        if prefetch_size is None:
+            prefetch_size = self._auto_prefetch_size if self._has_lazy_columns() else 0
+
+        sampler = DistributedSampler(
+            len(self), shuffle=should_shuffle, random_seed=random_seed, distributed=distributed
+        )
+        batcher = RandomAccessBatcher(
+            self,
+            sampler,
+            batch_size=batch_size,
+            ignore_last=ignore_last,
+            augmentation_pipeline=augmentation_pipeline,
+            prefetch_size=prefetch_size,
+        )
+        yield batcher
+
+
+class PandasDatasetManager(DatasetManager):
+    def __init__(self, backend: Backend):
+        self.backend: Backend = backend
+
+    def create(self, dataset, config, training_set_metadata) -> Dataset:
+        cache_fp = training_set_metadata.get(DATA_TRAIN_PARQUET_FP) or training_set_metadata.get(DATA_TRAIN_HDF5_FP)
+        return PandasDataset(dataset, get_proc_features(config), cache_fp, training_set_metadata)
+
+    def save(self, cache_path, dataset, config, training_set_metadata, tag) -> Dataset:
+        # Ensure path ends with .parquet
+        if not cache_path.endswith(".parquet"):
+            cache_path = os.path.splitext(cache_path)[0] + ".parquet"
+        _save_parquet(cache_path, dataset)
+        if tag == TRAINING:
+            training_set_metadata[DATA_TRAIN_PARQUET_FP] = cache_path
+        return dataset
+
+    def can_cache(self, skip_save_processed_input) -> bool:
+        return self.backend.is_coordinator() and not skip_save_processed_input
+
+    @property
+    def data_format(self) -> str:
+        return "parquet"

@@ -1,0 +1,21 @@
+version: 1.0
+name: sst3
+huggingface_dataset_id: tweet_eval
+huggingface_subsample: sentiment
+loader: hugging_face.HFLoader
+description: |
+  Three-class sentiment dataset (negative/neutral/positive).
+
+  Previously used the Stanford SST3 split (Stanford URL is no longer accessible).
+  Now uses tweet_eval/sentiment from HuggingFace as a functionally equivalent
+  3-class sentiment benchmark.
+
+  Labels: 0=negative, 1=neutral, 2=positive.
+columns:
+  - name: text
+    type: text
+  - name: label
+    type: category
+output_features:
+  - name: label
+    type: category

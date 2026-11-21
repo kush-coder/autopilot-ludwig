@@ -1,0 +1,319 @@
+#! /usr/bin/env python
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+import logging
+
+import torch
+from torch import nn
+
+from ludwig.api_annotations import DeveloperAPI
+from ludwig.constants import CATEGORY, ENCODER_OUTPUT
+from ludwig.encoders.base import Encoder
+from ludwig.encoders.registry import register_encoder
+from ludwig.encoders.types import EncoderOutputDict
+from ludwig.modules.embedding_modules import Embed
+from ludwig.schema.encoders.base import BaseEncoderConfig
+from ludwig.schema.encoders.category_encoders import (
+    CategoricalEmbedConfig,
+    CategoricalHashEncoderConfig,
+    CategoricalOneHotEncoderConfig,
+    CategoricalPassthroughEncoderConfig,
+    CategoricalSparseConfig,
+    CategoricalTargetEncoderConfig,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@DeveloperAPI
+@register_encoder("passthrough", [CATEGORY])
+class CategoricalPassthroughEncoder(Encoder):
+    def __init__(self, input_size=1, encoder_config=None, **kwargs):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+        self.input_size = input_size
+        self.identity = nn.Identity()
+
+    def forward(self, inputs: torch.Tensor, mask: torch.Tensor | None = None) -> EncoderOutputDict:
+        """
+        Args:
+            inputs: The inputs fed into the encoder. Shape: [batch x 1]
+        """
+        return {"encoder_output": self.identity(inputs.float())}
+
+    @staticmethod
+    def get_schema_cls() -> type[BaseEncoderConfig]:
+        return CategoricalPassthroughEncoderConfig
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([self.input_size])
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.input_shape
+
+    def get_embedding_layer(self) -> nn.Module:
+        return self.identity
+
+
+@DeveloperAPI
+@register_encoder("dense", CATEGORY)
+class CategoricalEmbedEncoder(Encoder):
+    def __init__(
+        self,
+        vocab: list[str],
+        embedding_size: int = 50,
+        embeddings_trainable: bool = True,
+        pretrained_embeddings: str | None = None,
+        embeddings_on_cpu: bool = False,
+        dropout: float = 0.0,
+        embedding_initializer: str | dict | None = None,
+        encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+
+        logger.debug("  Embed")
+        self.embed = Embed(
+            vocab=vocab,
+            embedding_size=embedding_size,
+            representation="dense",
+            embeddings_trainable=embeddings_trainable,
+            pretrained_embeddings=pretrained_embeddings,
+            embeddings_on_cpu=embeddings_on_cpu,
+            dropout=dropout,
+            embedding_initializer=embedding_initializer,
+        )
+        self.embedding_size = self.embed.embedding_size
+
+    def forward(self, inputs: torch.Tensor) -> EncoderOutputDict:
+        """
+        Args:
+            inputs: The inputs fed into the encoder. Shape: [batch x 1], type torch.int32.
+
+        Returns:
+            embeddings of shape [batch x embed size], type torch.float32.
+        """
+        embedded = self.embed(inputs)
+        return {ENCODER_OUTPUT: embedded}
+
+    @staticmethod
+    def get_schema_cls() -> type[BaseEncoderConfig]:
+        return CategoricalEmbedConfig
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return torch.Size([self.embedding_size])
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([1])
+
+
+@DeveloperAPI
+@register_encoder("sparse", CATEGORY)
+class CategoricalSparseEncoder(Encoder):
+    def __init__(
+        self,
+        vocab: list[str],
+        embeddings_trainable: bool = False,
+        pretrained_embeddings: str | None = None,
+        embeddings_on_cpu: bool = False,
+        dropout: float = 0.0,
+        embedding_initializer: str | dict | None = None,
+        encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+
+        logger.debug("  Embed")
+        self.embed = Embed(
+            vocab=vocab,
+            embedding_size=len(vocab),
+            representation="sparse",
+            embeddings_trainable=embeddings_trainable,
+            pretrained_embeddings=pretrained_embeddings,
+            embeddings_on_cpu=embeddings_on_cpu,
+            dropout=dropout,
+            embedding_initializer=embedding_initializer,
+        )
+        self.embedding_size = self.embed.embedding_size
+
+    def forward(self, inputs: torch.Tensor) -> EncoderOutputDict:
+        """
+        Args:
+            inputs: The inputs fed into the encoder. Shape: [batch x 1], type torch.int32.
+
+        Returns:
+            embeddings of shape [batch x embed size], type torch.float32.
+        """
+        embedded = self.embed(inputs)
+        return {ENCODER_OUTPUT: embedded}
+
+    @staticmethod
+    def get_schema_cls() -> type[BaseEncoderConfig]:
+        return CategoricalSparseConfig
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return torch.Size([self.embedding_size])
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([1])
+
+
+@DeveloperAPI
+@register_encoder("onehot", [CATEGORY])
+class CategoricalOneHotEncoder(Encoder):
+    def __init__(
+        self,
+        vocab: list[str],
+        encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+        self.vocab_size = len(vocab)
+        self.identity = nn.Identity()
+
+    def forward(self, inputs: torch.Tensor, mask: torch.Tensor | None = None) -> EncoderOutputDict:
+        """
+        Args:
+            inputs: The inputs fed into the encoder. Shape: [batch, 1] or [batch]
+        """
+        t = inputs.reshape(-1).long()
+        # the output of this must be a float so that it can be concatenated with other
+        # encoder outputs and passed to dense layers in the combiner, decoder, etc.
+        outputs = self.identity(torch.nn.functional.one_hot(t, num_classes=self.vocab_size).float())
+        return {"encoder_output": outputs}
+
+    @staticmethod
+    def get_schema_cls() -> type[BaseEncoderConfig]:
+        return CategoricalOneHotEncoderConfig
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([1])
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return torch.Size([self.vocab_size])
+
+    def get_embedding_layer(self) -> nn.Module:
+        return self.identity
+
+
+@DeveloperAPI
+@register_encoder("target", [CATEGORY])
+class CategoricalTargetEncoder(Encoder):
+    """Target encoding: encode categories by smoothed mean target value.
+
+    Cite: Micci-Barreca, "A Preprocessing Scheme for High-Cardinality Categorical
+    Attributes in Classification and Prediction Problems", ACM SIGKDD 2001.
+
+    Use when: high-cardinality categorical features (postal codes, user IDs) with
+    sufficient training data. Not suitable for small datasets (overfitting risk).
+    """
+
+    def __init__(self, vocab: list[str], output_size: int = 1, encoder_config=None, **kwargs):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+        self.vocab_size = len(vocab)
+        # Learnable target encoding per category (initialized to 0, set during training via metadata)
+        self.target_values = nn.Embedding(self.vocab_size, output_size)
+        nn.init.zeros_(self.target_values.weight)
+        self._output_size = output_size
+
+    def forward(self, inputs: torch.Tensor, mask: torch.Tensor | None = None) -> EncoderOutputDict:
+        """
+        Args:
+            inputs: The inputs fed into the encoder. Shape: [batch x 1], type torch.int32.
+        """
+        return {ENCODER_OUTPUT: self.target_values(inputs.long().squeeze(-1))}
+
+    @staticmethod
+    def get_schema_cls() -> type[BaseEncoderConfig]:
+        return CategoricalTargetEncoderConfig
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([1])
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return torch.Size([self._output_size])
+
+
+@DeveloperAPI
+@register_encoder("hash", [CATEGORY])
+class CategoricalHashEncoder(Encoder):
+    """Feature hashing encoder for ultra-high-cardinality categoricals.
+
+    Cite: Weinberger et al., "Feature Hashing for Large Scale Multitask Learning", ICML 2009.
+
+    Use when: extremely large vocabularies where embedding tables are too expensive,
+    or streaming settings where vocabulary is not known ahead of time.
+    """
+
+    def __init__(
+        self,
+        vocab: list[str],
+        num_hash_buckets: int = 1024,
+        embedding_size: int = 50,
+        encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+        self.num_hash_buckets = num_hash_buckets
+        self.embedding = nn.Embedding(num_hash_buckets, embedding_size)
+        self._output_size = embedding_size
+
+    def forward(self, inputs: torch.Tensor, mask: torch.Tensor | None = None) -> EncoderOutputDict:
+        """
+        Args:
+            inputs: The inputs fed into the encoder. Shape: [batch x 1], type torch.int32.
+        """
+        # Hash input indices to bucket range
+        hashed = inputs.long().squeeze(-1) % self.num_hash_buckets
+        return {ENCODER_OUTPUT: self.embedding(hashed)}
+
+    @staticmethod
+    def get_schema_cls() -> type[BaseEncoderConfig]:
+        return CategoricalHashEncoderConfig
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size([1])
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return torch.Size([self._output_size])

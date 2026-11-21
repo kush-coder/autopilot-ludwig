@@ -1,0 +1,99 @@
+from typing import Any
+
+from ludwig.api_annotations import DeveloperAPI
+from ludwig.constants import CATEGORY, MODEL_LLM, TEXT
+from ludwig.schema import utils as schema_utils
+from ludwig.schema.decoders.base import BaseDecoderConfig
+from ludwig.schema.decoders.utils import register_decoder_config
+from ludwig.schema.utils import LudwigBaseConfig
+
+
+@DeveloperAPI
+class BaseExtractorDecoderConfig(LudwigBaseConfig):
+    tokenizer: str = "hf_tokenizer"
+
+    input_size: int = schema_utils.PositiveInteger(
+        default=None,
+        allow_none=True,
+        description="Size of the input to the decoder.",
+    )
+
+    pretrained_model_name_or_path: str = schema_utils.String(
+        default="",
+        allow_none=True,
+        description="Path to the pretrained model or model identifier from huggingface.co/models.",
+    )
+
+    vocab_file: str = schema_utils.String(
+        default="",
+        allow_none=True,
+        description="Path to the vocabulary file.",
+    )
+
+    max_new_tokens: int = schema_utils.Integer(
+        default=None,
+        allow_none=True,
+        description="Maximum number of new tokens that will be generated.",
+    )
+
+    match_strategy: str = schema_utils.StringOptions(
+        options=["contains", "regex", "json_schema"],
+        default="contains",
+        allow_none=False,
+        description=(
+            "Strategy used to parse and validate the LLM's generated text. "
+            "'contains': substring matching (default). "
+            "'regex': match via a regular expression. "
+            "'json_schema': parse the output as JSON and validate the value."
+        ),
+    )
+
+
+@DeveloperAPI
+@register_decoder_config("text_extractor", [TEXT], model_types=[MODEL_LLM])
+class TextExtractorDecoderConfig(BaseExtractorDecoderConfig, BaseDecoderConfig):
+    @classmethod
+    def module_name(cls):
+        return "TextExtractorDecoder"
+
+    type: str = schema_utils.ProtectedString("text_extractor")
+
+
+@DeveloperAPI
+@register_decoder_config("category_extractor", [CATEGORY], model_types=[MODEL_LLM])
+class CategoryExtractorDecoderConfig(BaseExtractorDecoderConfig, BaseDecoderConfig):
+    @classmethod
+    def module_name(cls):
+        return "CategoryExtractorDecoder"
+
+    type: str = schema_utils.ProtectedString("category_extractor")
+
+    # Match is a dict of label class
+    match: dict[str, dict[str, Any]] = schema_utils.Dict(
+        default=None,
+        allow_none=False,
+        description="A dictionary of label classes and their corresponding "
+        "match patterns definitions that will be used to parse the output "
+        "of the LLM.",
+    )
+
+    str2idx: dict[str, int] = schema_utils.Dict(
+        default=None,
+        allow_none=True,
+        description="A dictionary of label classes and their corresponding "
+        "indices that will be used to parse the output of the LLM.",
+    )
+
+    fallback_label: str = schema_utils.String(
+        default="",
+        allow_none=True,
+        description="The label to use if the parser fails to parse the input.",
+    )
+
+    constrain_to_vocabulary: bool = schema_utils.Boolean(
+        default=False,
+        description=(
+            "When True, restrict generation to tokens that are valid prefixes of the category labels. "
+            "Implemented via a HuggingFace LogitsProcessor. Requires tokenizer='hf_tokenizer'."
+        ),
+    )

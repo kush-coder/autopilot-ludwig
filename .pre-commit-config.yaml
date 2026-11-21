@@ -1,0 +1,61 @@
+# Apply to all files without committing:
+#   pre-commit run --all-files
+# Apply to changed files:
+#   pre-commit run
+# Update this file:
+#   pre-commit autoupdate
+# Run a specific hook:
+#   pre-commit run <hook id>
+
+ci:
+  autofix_prs: true
+  autoupdate_commit_msg: "[pre-commit.ci] pre-commit suggestions"
+  autoupdate_schedule: weekly
+
+# Pin to the system Python version (3.14 post OS upgrade; previously 3.12).
+# Note: pre-commit.ci hosted runners default to 3.14 which is now also local.
+default_language_version:
+  python: python3.14
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-ast
+      - id: fix-byte-order-marker
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5
+    hooks:
+      - id: ruff
+        name: Lint and fix (ruff)
+        args: [--fix]
+      - id: ruff-format
+        name: Format code (ruff)
+  - repo: https://github.com/asottile/blacken-docs
+    rev: 1.20.0
+    hooks:
+      - id: blacken-docs
+        args: [--line-length=120]
+        exclude: "IMPROVEMENT_PLAN.md"
+  - repo: https://github.com/hukkin/mdformat
+    rev: 1.0.0
+    hooks:
+      - id: mdformat
+        additional_dependencies:
+          - mdformat-gfm==1.0.0
+          - mdformat_frontmatter==2.0.10
+        exclude: "CHANGELOG.md|IMPROVEMENT_PLAN.md"
+  - repo: https://github.com/yoheimuta/protolint
+    rev: v0.58.0
+    hooks:
+      - id: protolint

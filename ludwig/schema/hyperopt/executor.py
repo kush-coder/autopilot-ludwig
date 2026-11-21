@@ -1,0 +1,114 @@
+from dataclasses import field
+
+import pydantic
+
+from ludwig.api_annotations import DeveloperAPI
+from ludwig.constants import RAY
+from ludwig.error import ConfigValidationError
+from ludwig.schema import utils as schema_utils
+from ludwig.schema.hyperopt.scheduler import BaseSchedulerConfig, SchedulerDataclassField
+
+
+@DeveloperAPI
+class ExecutorConfig(schema_utils.LudwigBaseConfig):
+    """Basic executor settings."""
+
+    type: str = schema_utils.ProtectedString(RAY)
+
+    num_samples: int = schema_utils.PositiveInteger(
+        default=None,
+        allow_none=True,
+        description=(
+            "This parameter, along with the `space` specifications in the `parameters` section, controls how many "
+            "trials are generated."
+        ),
+    )
+
+    time_budget_s: int = schema_utils.PositiveInteger(
+        default=3600, allow_none=True, description="The number of seconds for the entire hyperopt run."
+    )
+
+    trial_driver_resources: dict[str, float] = schema_utils.Dict(
+        default=None,
+        description=(
+            "The resources reserved by each trial driver. This differs from cpu_resources_per_trial and "
+            "gpu_resources_per_trial because these resources are reserved for the driver, not its subsequent "
+            "workers. Only used when the trials themselves are on the Ray backend. Defaults to 1 CPU."
+        ),
+    )
+
+    cpu_resources_per_trial: int = schema_utils.PositiveInteger(
+        default=1, description="The number of CPU cores allocated to each trial"
+    )
+
+    gpu_resources_per_trial: int = schema_utils.NonNegativeInteger(
+        default=0, description="The number of GPU devices allocated to each trial"
+    )
+
+    kubernetes_namespace: str | None = schema_utils.String(
+        default=None,
+        allow_none=True,
+        description=(
+            "When running on Kubernetes, provide the namespace of the Ray cluster to sync results between "
+            "pods. See the Ray docs for more info."
+        ),
+    )
+
+    max_concurrent_trials: str | int | None = schema_utils.OneOfOptionsField(
+        default="auto",
+        allow_none=True,
+        description=("The maximum number of trials to train concurrently. Defaults to auto if not specified."),
+        field_options=[
+            schema_utils.PositiveInteger(
+                default=1, allow_none=False, description="Manually set a number of concurrent trials."
+            ),
+            schema_utils.StringOptions(
+                options=["auto"],
+                default="auto",
+                allow_none=False,
+                description="Automatically set number of concurrent trials.",
+            ),
+        ],
+    )
+
+    scheduler: BaseSchedulerConfig = SchedulerDataclassField(description="")
+
+
+@DeveloperAPI
+def ExecutorDataclassField(description: str, default: dict = {}):
+    class ExecutorConfigField(schema_utils.SchemaField):
+        def _deserialize(self, value, attr, data, **kwargs):
+            if isinstance(value, dict):
+                try:
+                    return ExecutorConfig.model_validate(value)
+                except (TypeError, ConfigValidationError):
+                    raise ConfigValidationError(f"Invalid params for executor: {value}, see ExecutorConfig class.")
+            raise ConfigValidationError("Field should be dict")
+
+        def _jsonschema_type_mapping(self):
+            return {
+                **schema_utils.unload_jsonschema_from_config_class(ExecutorConfig),
+                "title": "executor",
+                "description": description,
+            }
+
+    if not isinstance(default, dict):
+        raise ConfigValidationError(f"Invalid default: `{default}`")
+
+    load_default = lambda: ExecutorConfig.model_validate(default)
+    try:
+        dump_default = ExecutorConfig.model_validate(default).to_dict()
+    except pydantic.ValidationError:
+        dump_default = default if isinstance(default, dict) else {}
+
+    return field(
+        metadata={
+            "marshmallow_field": ExecutorConfigField(
+                allow_none=False,
+                load_default=load_default,
+                dump_default=dump_default,
+                metadata={"description": description, "parameter_metadata": None},
+            )
+        },
+        default_factory=load_default,
+    )

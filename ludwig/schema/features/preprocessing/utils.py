@@ -1,0 +1,83 @@
+from dataclasses import field
+
+import pydantic
+
+from ludwig.api_annotations import DeveloperAPI
+from ludwig.error import ConfigValidationError
+from ludwig.schema import utils as schema_utils
+from ludwig.schema.features.preprocessing.base import BasePreprocessingConfig
+from ludwig.utils.registry import Registry
+
+preprocessing_registry = Registry()
+
+
+@DeveloperAPI
+def register_preprocessor(name: str):
+    def wrap(preprocessing_config: BasePreprocessingConfig):
+        preprocessing_registry[name] = preprocessing_config
+        return preprocessing_config
+
+    return wrap
+
+
+@DeveloperAPI
+def PreprocessingDataclassField(feature_type: str):
+    """Custom dataclass field that when used inside a dataclass will allow the user to specify a preprocessing
+    config.
+
+    Returns: Initialized dataclass field that converts an untyped dict with params to a preprocessing config.
+    """
+
+    class PreprocessingConfigField(schema_utils.SchemaField):
+        """Custom field that deserializes a dict for a valid preprocessing config from the preprocessing_registry
+        and creates a corresponding JSON schema for external usage."""
+
+        def _deserialize(self, value, attr, data, **kwargs):
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                if feature_type in preprocessing_registry:
+                    pre = preprocessing_registry[feature_type]
+                    try:
+                        return pre.model_validate(value)
+                    except (TypeError, ConfigValidationError) as error:
+                        raise ConfigValidationError(
+                            f"Invalid preprocessing params: {value}, see `{pre}` definition. Error: {error}"
+                        )
+                raise ConfigValidationError(
+                    f"Invalid params for preprocessor: {value}, expect dict with at least a valid `type` attribute."
+                )
+            raise ConfigValidationError("Field should be None or dict")
+
+        def _jsonschema_type_mapping(self):
+            preprocessor_cls = preprocessing_registry[feature_type]
+            props = schema_utils.unload_jsonschema_from_config_class(preprocessor_cls)["properties"]
+            return {
+                "type": "object",
+                "properties": props,
+                "title": "preprocessing_options",
+                "additionalProperties": True,
+            }
+
+    try:
+        preprocessor = preprocessing_registry[feature_type]
+        load_default = lambda: preprocessor.model_validate({})
+        try:
+            dump_default = preprocessor.model_validate({}).to_dict()
+        except pydantic.ValidationError:
+            dump_default = {}
+
+        return field(
+            metadata={
+                "marshmallow_field": PreprocessingConfigField(
+                    allow_none=False,
+                    dump_default=dump_default,
+                    load_default=load_default,
+                )
+            },
+            default_factory=load_default,
+        )
+    except Exception as e:
+        raise ConfigValidationError(
+            f"Unsupported preprocessing type: {feature_type}. See preprocessing_registry. Details: {e}"
+        )

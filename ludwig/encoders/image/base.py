@@ -1,0 +1,275 @@
+#! /usr/bin/env python
+# Copyright (c) 2023 Predibase, Inc., 2019 Uber Technologies, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+import logging
+from typing import Any
+
+import torch
+
+from ludwig.api_annotations import DeveloperAPI
+from ludwig.constants import ENCODER_OUTPUT, ENCODER_OUTPUT_STATE, IMAGE
+from ludwig.encoders.base import Encoder
+from ludwig.encoders.registry import register_encoder
+from ludwig.encoders.types import EncoderOutputDict
+from ludwig.modules.convolutional_modules import Conv2DStack, UNetDownStack
+from ludwig.modules.fully_connected_modules import FCStack
+from ludwig.modules.mlp_mixer_modules import MLPMixer
+from ludwig.schema.encoders.image.base import (
+    ImageEncoderConfig,
+    MLPMixerConfig,
+    Stacked2DCNNConfig,
+    UNetEncoderConfig,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@DeveloperAPI
+class ImageEncoder(Encoder):
+    pass
+
+
+@DeveloperAPI
+@register_encoder("stacked_cnn", IMAGE)
+class Stacked2DCNN(ImageEncoder):
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        conv_layers: list[dict] | None = None,
+        num_conv_layers: int | None = None,
+        num_channels: int | None = None,
+        out_channels: int = 32,
+        kernel_size: int | tuple[int] = 3,
+        stride: int | tuple[int] = 1,
+        padding: int | tuple[int] | str = "valid",
+        dilation: int | tuple[int] = 1,
+        conv_use_bias: bool = True,
+        padding_mode: str = "zeros",
+        conv_norm: str | None = None,
+        conv_norm_params: dict[str, Any] | None = None,
+        conv_activation: str = "relu",
+        conv_dropout: int = 0,
+        pool_function: str = "max",
+        pool_kernel_size: int | tuple[int] = 2,
+        pool_stride: int | tuple[int] | None = None,
+        pool_padding: int | tuple[int] = 0,
+        pool_dilation: int | tuple[int] = 1,
+        groups: int = 1,
+        fc_layers: list[dict] | None = None,
+        num_fc_layers: int | None = 1,
+        output_size: int = 128,
+        fc_use_bias: bool = True,
+        fc_weights_initializer: str = "xavier_uniform",
+        fc_bias_initializer: str = "zeros",
+        fc_norm: str | None = None,
+        fc_norm_params: dict[str, Any] | None = None,
+        fc_activation: str = "relu",
+        fc_dropout: float = 0,
+        encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+
+        # map parameter input feature config names to internal names
+        img_height = height
+        img_width = width
+        first_in_channels = num_channels
+
+        self._input_shape = (first_in_channels, img_height, img_width)
+
+        if first_in_channels is None:
+            raise ValueError("first_in_channels must not be None.")
+
+        logger.debug("  Conv2DStack")
+        self.conv_stack_2d = Conv2DStack(
+            img_height=img_height,
+            img_width=img_width,
+            layers=conv_layers,
+            num_layers=num_conv_layers,
+            first_in_channels=first_in_channels,
+            default_out_channels=out_channels,
+            default_kernel_size=kernel_size,
+            default_stride=stride,
+            default_padding=padding,
+            default_dilation=dilation,
+            default_groups=groups,
+            default_use_bias=conv_use_bias,
+            default_padding_mode=padding_mode,
+            default_norm=conv_norm,
+            default_norm_params=conv_norm_params,
+            default_activation=conv_activation,
+            default_dropout=conv_dropout,
+            default_pool_function=pool_function,
+            default_pool_kernel_size=pool_kernel_size,
+            default_pool_stride=pool_stride,
+            default_pool_padding=pool_padding,
+            default_pool_dilation=pool_dilation,
+        )
+        out_channels, img_height, img_width = self.conv_stack_2d.output_shape
+        first_fc_layer_input_size = out_channels * img_height * img_width
+
+        self.flatten = torch.nn.Flatten()
+
+        logger.debug("  FCStack")
+        self.fc_stack = FCStack(
+            first_layer_input_size=first_fc_layer_input_size,
+            layers=fc_layers,
+            num_layers=num_fc_layers,
+            default_output_size=output_size,
+            default_use_bias=fc_use_bias,
+            default_weights_initializer=fc_weights_initializer,
+            default_bias_initializer=fc_bias_initializer,
+            default_norm=fc_norm,
+            default_norm_params=fc_norm_params,
+            default_activation=fc_activation,
+            default_dropout=fc_dropout,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> EncoderOutputDict:
+        """Forward pass through the encoder.
+
+        Args:
+            inputs: The inputs fed into the encoder. Shape: [batch x channels x height x width].
+        """
+
+        hidden = self.conv_stack_2d(inputs)
+        hidden = self.flatten(hidden)
+        outputs = self.fc_stack(hidden)
+
+        return {ENCODER_OUTPUT: outputs}
+
+    @staticmethod
+    def get_schema_cls() -> type[ImageEncoderConfig]:
+        return Stacked2DCNNConfig
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.fc_stack.output_shape
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size(self._input_shape)
+
+
+@DeveloperAPI
+@register_encoder("mlp_mixer", IMAGE)
+class MLPMixerEncoder(ImageEncoder):
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        num_channels: int | None = None,
+        patch_size: int = 16,
+        embed_size: int = 512,
+        token_size: int = 2048,
+        channel_dim: int = 256,
+        num_layers: int = 8,
+        dropout: float = 0.0,
+        avg_pool: bool = True,
+        encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+        # map parameter input feature config names to internal names
+        img_height = height
+        img_width = width
+        in_channels = num_channels
+
+        if num_channels is None:
+            raise RuntimeError("num_channels must not be None")
+
+        self._input_shape = (in_channels, img_height, img_width)
+
+        logger.debug("  MLPMixer")
+        self.mlp_mixer = MLPMixer(
+            img_height=img_height,
+            img_width=img_width,
+            in_channels=in_channels,
+            patch_size=patch_size,
+            embed_size=embed_size,
+            token_size=token_size,
+            channel_dim=channel_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            avg_pool=avg_pool,
+        )
+
+        self._output_shape = self.mlp_mixer.output_shape
+
+    def forward(self, inputs: torch.Tensor) -> EncoderOutputDict:
+        hidden = self.mlp_mixer(inputs)
+        return {ENCODER_OUTPUT: hidden}
+
+    @staticmethod
+    def get_schema_cls() -> type[ImageEncoderConfig]:
+        return MLPMixerConfig
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return torch.Size(self._input_shape)
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self._output_shape
+
+
+@DeveloperAPI
+@register_encoder("unet", IMAGE)
+class UNetEncoder(ImageEncoder):
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        num_channels: int = 3,
+        conv_norm: str | None = None,
+        encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = encoder_config
+
+        logger.debug(f" {self.name}")
+        if height % 16 or width % 16:
+            raise ValueError(f"Invalid `height` {height} or `width` {width} for unet encoder")
+
+        self.unet = UNetDownStack(
+            img_height=height,
+            img_width=width,
+            in_channels=num_channels,
+            norm=conv_norm,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> EncoderOutputDict:
+        hidden, skips = self.unet(inputs)
+        return {ENCODER_OUTPUT: hidden, ENCODER_OUTPUT_STATE: skips}
+
+    @staticmethod
+    def get_schema_cls() -> type[ImageEncoderConfig]:
+        return UNetEncoderConfig
+
+    @property
+    def output_shape(self) -> torch.Size:
+        return self.unet.output_shape
+
+    @property
+    def input_shape(self) -> torch.Size:
+        return self.unet.input_shape

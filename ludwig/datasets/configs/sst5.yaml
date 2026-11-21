@@ -1,0 +1,19 @@
+version: 1.0
+name: sst5
+huggingface_dataset_id: SetFit/sst5
+loader: hugging_face.HFLoader
+description: |
+  The SST5 dataset (Stanford Sentiment Treebank, 5-class).
+
+  Loaded from HuggingFace (SetFit/sst5) since the original Stanford
+  download URL (nlp.stanford.edu) is no longer publicly accessible.
+
+  Labels: 0=very negative, 1=negative, 2=neutral, 3=positive, 4=very positive.
+columns:
+  - name: text
+    type: text
+  - name: label
+    type: category
+output_features:
+  - name: label
+    type: category

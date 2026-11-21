@@ -1,0 +1,243 @@
+import pytest
+from pydantic import ValidationError as PydanticValidationError
+
+from ludwig.config_validation.validation import get_validator, validate
+from ludwig.schema import utils as schema_utils
+
+
+def get_marshmallow_field_from_metadata(dfield):
+    """Helper method for extracting the marshmallow field from pydantic field metadata."""
+    metadata = dfield.metadata
+    if isinstance(metadata, dict):
+        return metadata.get("marshmallow_field")
+    if isinstance(metadata, (list, tuple)):
+        for item in metadata:
+            if hasattr(item, "_deserialize"):
+                return item
+    return None
+
+
+def test_metaclass_field_override_with_protectedstring():
+    """Regression test: _LudwigModelMeta must preserve field annotations when a subclass overrides a base
+    class field with ProtectedString (or any FieldInfo default).
+
+    On Python 3.14 the class namespace carries annotations in __annotate_func__ rather than
+    __annotations__, so naively reading namespace['__annotations__'] returns an empty dict.
+    The metaclass must evaluate __annotate_func__ when present so that the annotations are not
+    silently discarded, which would make pydantic raise
+    'Field X requires a type annotation' at class definition time.
+    See https://github.com/ludwig-ai/ludwig/issues/4142 (Python 3.14 regression).
+    """
+
+    class Base(schema_utils.LudwigBaseConfig):
+        type: str
+
+    class Child(Base):
+        type: str = schema_utils.ProtectedString("child_type")
+
+    instance = Child()
+    assert instance.type == "child_type"
+
+    with pytest.raises(PydanticValidationError):
+        Child(type="wrong_type")
+
+
+def test_metaclass_annotations_not_lost_on_py314():
+    """Regression test: LudwigBaseConfig subclass with multiple annotated fields must retain all
+    annotations even on Python 3.14 (where __annotate_func__ replaces __annotations__ in the
+    class namespace during metaclass __new__).
+    """
+
+    class MyConfig(schema_utils.LudwigBaseConfig):
+        name: str = schema_utils.StringOptions(["a", "b"], default="a", allow_none=False)
+        value: int | None = None
+        flag: bool = False
+
+    instance = MyConfig()
+    assert instance.name == "a"
+    assert instance.value is None
+    assert instance.flag is False
+
+    # All three fields must appear in the pydantic model fields
+    fields = MyConfig.model_fields
+    assert "name" in fields
+    assert "value" in fields
+    assert "flag" in fields
+
+
+# Simple marshmallow fields:
+
+
+def test_StringOptions():
+    # Test case of default conflicting with allowed options:
+    test_options = ["one"]
+    with pytest.raises(ValueError):
+        schema_utils.StringOptions(test_options, default=None, allow_none=False)
+
+    # Test creating a schema with simple option, null not allowed:
+    test_options = ["one"]
+
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: str = schema_utils.StringOptions(test_options, "one", allow_none=False)
+
+    with pytest.raises(PydanticValidationError):
+        CustomTestSchema.model_validate({"foo": None})
+
+
+# Complex, custom marshmallow fields:
+
+
+def test_Embed():
+    # Test simple schema creation:
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: str | int | None = schema_utils.Embed()
+
+    # Test null/empty loading cases:
+    assert CustomTestSchema.model_validate({}).foo is None
+    assert CustomTestSchema.model_validate({"foo": None}).foo is None
+
+    # Test valid strings/numbers:
+    assert CustomTestSchema.model_validate({"foo": "add"}).foo == "add"
+    assert CustomTestSchema.model_validate({"foo": 1}).foo == 1
+
+
+def test_InitializerOrDict():
+    # Test default value validation:
+    with pytest.raises(Exception):
+        schema_utils.InitializerOrDict("test")
+
+    # Test simple schema creation:
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: str | dict | None = schema_utils.InitializerOrDict()
+
+    # Test valid loads:
+    assert CustomTestSchema.model_validate({}).foo == "xavier_uniform"
+    assert CustomTestSchema.model_validate({"foo": "zeros"}).foo == "zeros"
+
+    # Test valid dict loads:
+    assert CustomTestSchema.model_validate({"foo": {"type": "zeros"}}).foo == {"type": "zeros"}
+
+
+def test_FloatRangeTupleDataclassField():
+    # Test dimensional mismatch:
+    with pytest.raises(Exception):
+        schema_utils.FloatRangeTupleDataclassField(n=3, default=(1, 1))
+
+    # Test default schema creation:
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: tuple[float, float] | None = schema_utils.FloatRangeTupleDataclassField(allow_none=True)
+
+    # Test empty load:
+    assert CustomTestSchema.model_validate({}).foo == (0.9, 0.999)
+    assert CustomTestSchema.model_validate({"foo": None}).foo is None
+
+    # Test valid loads:
+    assert CustomTestSchema.model_validate({"foo": [0.5, 0.6]}).foo == (0.5, 0.6)
+
+    # Test non-default schema (N=3, other custom metadata):
+    class CustomTestSchema2(schema_utils.LudwigBaseConfig):
+        foo: tuple[float, float, float] | None = schema_utils.FloatRangeTupleDataclassField(
+            n=3, default=(1, 1, 1), min=-10, max=10
+        )
+
+    assert CustomTestSchema2.model_validate({}).foo == (1, 1, 1)
+    assert CustomTestSchema2.model_validate({"foo": [2, 2, 2]}).foo == (2, 2, 2)
+
+
+def test_OneOfOptionsField():
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: float | str = schema_utils.OneOfOptionsField(
+            default=0.1,
+            description="",
+            allow_none=False,
+            field_options=[
+                schema_utils.FloatRange(default=0.001, min=0, max=1, allow_none=False),
+                schema_utils.StringOptions(options=["placeholder"], default="placeholder", allow_none=False),
+            ],
+        )
+
+    # Test valid loads:
+    assert CustomTestSchema.model_validate({}).foo == 0.1
+    assert CustomTestSchema().foo == 0.1
+
+    # Reverse the order and allow none (via StringOptions):
+    class CustomTestSchema2(schema_utils.LudwigBaseConfig):
+        foo: float | str | None = schema_utils.OneOfOptionsField(
+            default="placeholder",
+            description="",
+            field_options=[
+                schema_utils.FloatRange(default=0.001, min=0, max=1, allow_none=False),
+                schema_utils.StringOptions(options=["placeholder"], default="placeholder", allow_none=False),
+            ],
+            allow_none=True,
+        )
+
+    # Test valid loads:
+    assert CustomTestSchema2.model_validate({}).foo == "placeholder"
+    assert CustomTestSchema2.model_validate({"foo": 0.1}).foo == 0.1
+    assert CustomTestSchema2().foo == "placeholder"
+    CustomTestSchema2.model_validate({"foo": None})
+
+    # Test JSON schema generation:
+    json = schema_utils.unload_jsonschema_from_config_class(CustomTestSchema2)
+    assert "foo" in json["properties"]
+
+
+def test_OneOfOptionsField_allows_none():
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: float | str | None = schema_utils.OneOfOptionsField(
+            default=None,
+            allow_none=True,
+            description="",
+            field_options=[
+                schema_utils.PositiveInteger(description="", default=1, allow_none=False),
+                schema_utils.List(list_type=int, allow_none=False),
+            ],
+        )
+
+    json = schema_utils.unload_jsonschema_from_config_class(CustomTestSchema)
+    schema = {
+        "type": "object",
+        "properties": {
+            "hello": json,
+        },
+        "definitions": {},
+    }
+    validate(instance={"hello": {"foo": None}}, schema=schema, cls=get_validator())
+
+
+def test_OneOfOptionsField_multiple_fields_allow_none():
+    # With pydantic, multiple fields allowing none is handled by union validation.
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: float | str | None = schema_utils.OneOfOptionsField(
+            default=None,
+            description="",
+            field_options=[
+                schema_utils.PositiveInteger(description="", default=1, allow_none=True),
+                schema_utils.List(list_type=int, allow_none=True),
+            ],
+        )
+
+    assert CustomTestSchema().foo is None
+
+
+def test_OneOfOptionsField_allows_none_one_field_allows_none():
+    class CustomTestSchema(schema_utils.LudwigBaseConfig):
+        foo: float | str | None = schema_utils.OneOfOptionsField(
+            default=None,
+            description="",
+            field_options=[
+                schema_utils.PositiveInteger(description="", default=1, allow_none=False),
+                schema_utils.List(list_type=int, allow_none=True),
+            ],
+        )
+
+    json = schema_utils.unload_jsonschema_from_config_class(CustomTestSchema)
+    schema = {
+        "type": "object",
+        "properties": {
+            "hello": json,
+        },
+        "definitions": {},
+    }
+    validate(instance={"hello": {"foo": None}}, schema=schema, cls=get_validator())

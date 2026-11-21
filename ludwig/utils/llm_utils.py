@@ -1,0 +1,830 @@
+from __future__ import annotations
+
+import copy
+import logging
+import tempfile
+from typing import TYPE_CHECKING, Union
+
+import torch
+import torch.nn.functional as F
+import transformers
+from packaging import version
+
+try:
+    from bitsandbytes.nn.modules import Embedding as BnbEmbedding
+except ImportError:
+    BnbEmbedding = None
+from transformers import AutoModelForCausalLM, TextStreamer
+
+from ludwig.constants import IGNORE_INDEX_TOKEN_ID, LOGITS, PREDICTIONS, PROBABILITIES
+from ludwig.schema.trainer import LLMTrainerConfig
+from ludwig.utils.error_handling_utils import default_retry
+from ludwig.utils.logging_utils import log_once
+from ludwig.utils.model_utils import find_embedding_layer_with_path
+
+if TYPE_CHECKING:
+    from transformers import AutoConfig, PreTrainedModel, PreTrainedTokenizer
+
+    from ludwig.schema.encoders.text_encoders import LLMEncoderConfig
+    from ludwig.schema.model_types.llm import LLMModelConfig
+
+
+logger = logging.getLogger(__name__)
+
+transformers_436 = version.parse(transformers.__version__) >= version.parse("4.36.0")
+
+FALLBACK_CONTEXT_LEN = 2048
+
+_MODELS_WITH_DEVICE_MAP_AUTO_EXCLUSION = set()
+
+
+@default_retry(tries=8, exceptions=OSError)
+def load_pretrained_from_config(
+    config_obj: LLMModelConfig | LLMEncoderConfig,
+    model_config: AutoConfig | None = None,
+    weights_save_path: str | None = None,
+) -> PreTrainedModel:
+    load_kwargs = {}
+    quantization = config_obj.quantization
+    if quantization and getattr(quantization, "backend", "bitsandbytes") == "bitsandbytes":
+        # Apply bitsandbytes quantization configuration at model load time.
+        load_kwargs["dtype"] = getattr(torch, quantization.bnb_4bit_compute_dtype)
+        load_kwargs["quantization_config"] = quantization.to_bitsandbytes()
+        load_kwargs["device_map"] = "auto"
+
+        if transformers_436:
+            load_kwargs["attn_implementation"] = "eager"
+    else:
+        # Either no quantization, or torchao — which quantizes the model *after* load, not
+        # via transformers' BitsAndBytesConfig. Load in float32 by default to avoid CUBLAS
+        # errors with small hidden sizes and to ensure numerical stability during training
+        # without mixed-precision.
+        load_kwargs["dtype"] = torch.float32
+
+    config_modified = False
+    if config_obj.model_parameters:
+        # Add any model specific parameters to the load kwargs
+        for param_name, param_value in config_obj.model_parameters.to_dict().items():
+            # Not all parameters are supported by all models, so we only add the parameter to the load kwargs
+            # if it is supported by the model.
+            if param_value is None:
+                continue
+
+            if hasattr(model_config, param_name):
+                if isinstance(param_value, dict):
+                    # For nested dict params (e.g. rope_scaling), merge with existing
+                    # config values to preserve defaults like rope_theta.
+                    existing = getattr(model_config, param_name, {}) or {}
+                    existing.update(param_value)
+                    setattr(model_config, param_name, existing)
+                    config_modified = True
+                else:
+                    load_kwargs[param_name] = param_value
+            else:
+                logger.warning(f"Parameter {param_name} is not supported by {config_obj.base_model}. Skipping.")
+
+    # Only pass config= when we've directly modified it (e.g. rope_scaling merge).
+    if config_modified:
+        load_kwargs["config"] = model_config
+
+    logger.info("Loading large language model...")
+    pretrained_model_name_or_path = weights_save_path or config_obj.base_model
+    trust_remote_code = getattr(config_obj, "trust_remote_code", False)
+    is_multimodal = getattr(config_obj, "is_multimodal", False)
+    if is_multimodal:
+        # VLMs — Qwen2-VL, LLaVA, InternVL, Idefics etc. — register their own vision-to-sequence
+        # head. AutoModelForVision2Seq picks the right class automatically so the vision tower,
+        # projector, and LM head all come along together.
+        from transformers import AutoModelForVision2Seq
+
+        logger.info("Loading multimodal (VLM) base model via AutoModelForVision2Seq")
+        model: PreTrainedModel = AutoModelForVision2Seq.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=trust_remote_code, **load_kwargs
+        )
+    else:
+        model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=trust_remote_code, **load_kwargs
+        )
+    return model
+
+
+def to_device(
+    model: PreTrainedModel,
+    device: str | torch.DeviceObjType,
+    config_obj: LLMModelConfig,
+    curr_device: torch.DeviceObjType,
+) -> tuple[PreTrainedModel, torch.DeviceObjType]:
+    """Move an LLM to the requested device, accounting for sharding and adapters.
+
+    Args:
+        model: Pretrained model to put on device
+        config_obj: LLM config
+        curr_device: The current device that the model is on
+
+    Returns:
+        `model` moved to `device`
+    """
+    device = torch.device(device)
+
+    if device.type == curr_device.type:
+        log_once(f"Model already on device'{device}'.")
+        return model, device
+    else:
+        log_once(f"Moving LLM from '{curr_device}' to '{device}'.")
+
+    model_kwargs = {}
+    num_gpus = torch.cuda.device_count()
+    if device == torch.device("cuda") and num_gpus > 1:
+        # TODO: make this configurable in the future. These parameters are from FastChat:
+        # https://github.com/lm-sys/FastChat/blob/0e958b852a14f4bef5f0e9d7a5e7373477329cf2/fastchat/serve/inference.py#L90
+        # TODO: Wrap device_map="auto" in a try-except block since it may not be supported for all models (E.g. BertLMHead)
+        # We don't add quantization here (float16 or bfloat16) since we may not always want to quantize. We should
+        # make quantization configurable in the future via the trainer config.
+        model_kwargs.update(
+            {
+                "low_cpu_mem_usage": True,
+                "max_memory": dict.fromkeys(range(num_gpus), "13GiB"),
+            }
+        )
+
+        if config_obj.base_model not in _MODELS_WITH_DEVICE_MAP_AUTO_EXCLUSION:
+            model_kwargs["device_map"] = "auto"
+
+        if config_obj.quantization:
+            model_kwargs["quantization_config"] = config_obj.quantization.to_bitsandbytes()
+
+        # we save and reload the weights to ensure that they can be sharded across the GPUs using `from_pretrained`
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save_pretrained(tmpdir)
+
+            if config_obj.adapter:
+                model = AutoModelForCausalLM.from_pretrained(
+                    config_obj.base_model,
+                    trust_remote_code=getattr(config_obj, "trust_remote_code", False),
+                    **model_kwargs,
+                )
+
+                # Leave this import inline to support a minimal install of Ludwig
+                from peft import PeftModel
+
+                model = PeftModel.from_pretrained(
+                    model,
+                    tmpdir,
+                    torch_dtype=torch.float16,
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    tmpdir,
+                    trust_remote_code=getattr(config_obj, "trust_remote_code", False),
+                    **model_kwargs,
+                )
+    else:
+        model = model.to(device)
+
+    return model, device
+
+
+def _load_peft_config(pretrained_adapter_weights: str):
+    """Load a PeftConfig, fixing known compatibility issues with newer PEFT versions."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+    from peft import PeftConfig
+
+    config_file = hf_hub_download(pretrained_adapter_weights, "adapter_config.json")
+    with open(config_file) as f:
+        config_dict = json.load(f)
+
+    # AdaLoRA requires total_step > 0 in newer PEFT versions, but pretrained
+    # configs may have total_step=None.
+    if config_dict.get("peft_type") == "ADALORA" and not config_dict.get("total_step"):
+        config_dict["total_step"] = 10000
+
+    return PeftConfig.from_peft_type(**config_dict)
+
+
+def initialize_adapter(model: PreTrainedModel, config_obj: "LLMModelConfig") -> Union["PeftModel", PreTrainedModel]:  # noqa F821
+    """Wrap a pretrained model with a PEFT model for fine-tuning.
+
+    Dispatches to the multi-adapter path when ``config_obj.adapters`` is set (several
+    named adapters registered on the same base, optional weighted merge, runtime
+    switching via ``set_adapter``) and to the single-adapter path for ``config_obj.adapter``.
+    The two fields are mutually exclusive at the schema layer.
+
+    Args:
+         model: Pretrained model to fine-tune with an adapter.
+         config_obj: LLM config
+
+    Returns:
+        ``model`` wrapped in a PEFT model if an adapter config was provided, otherwise
+        ``model`` unaltered.
+    """
+    if getattr(config_obj, "adapters", None) is not None:
+        return _initialize_multi_adapters(model, config_obj)
+
+    if config_obj.adapter:
+        if config_obj.adapter.pretrained_adapter_weights:
+            # Load pretrained adapter weights if specified.
+            logger.info(f"Using pretrained adapter weights: {config_obj.adapter.pretrained_adapter_weights}")
+
+            # Leave this import inline to support a minimal install of Ludwig
+            from peft import MODEL_TYPE_TO_PEFT_MODEL_MAPPING, PeftConfig  # noqa
+
+            peft_config = _load_peft_config(config_obj.adapter.pretrained_adapter_weights)
+
+            model = MODEL_TYPE_TO_PEFT_MODEL_MAPPING[peft_config.task_type].from_pretrained(
+                model, config_obj.adapter.pretrained_adapter_weights, config=peft_config
+            )
+        else:
+            # Leave this import inline to support a minimal install of Ludwig
+            from peft import get_peft_model, TaskType
+
+            # If no pretrained adapter is provided, we want to load untrained weights into the model
+            peft_config = config_obj.adapter.to_config(
+                task_type=TaskType.CAUSAL_LM, tokenizer_name_or_path=config_obj.base_model
+            )
+
+            model = get_peft_model(model, peft_config)
+
+    return model
+
+
+def _initialize_multi_adapters(model: PreTrainedModel, config_obj: "LLMModelConfig") -> "PeftModel":  # noqa F821
+    """Attach several named PEFT adapters to ``model`` and (optionally) a merged one.
+
+    PEFT's public multi-adapter surface:
+      * ``get_peft_model(base, cfg, adapter_name=...)`` creates a PeftModel with one named
+        adapter. We use the first configured adapter here as the anchor.
+      * ``peft_model.add_adapter(adapter_name, cfg)`` registers additional adapters on the
+        same PeftModel.
+      * ``peft_model.add_weighted_adapter(source_names, weights, name, combination_type,
+        density)`` produces a new adapter by combining existing ones. Used when
+        ``adapters.merge`` is set.
+      * ``peft_model.set_adapter(name)`` designates the default adapter. Only one adapter
+        is active at a time — users switch explicitly at inference, or ask for the merged
+        adapter as the default.
+    """
+    from peft import get_peft_model, TaskType  # imported inline for minimal installs
+
+    adapters_cfg = config_obj.adapters
+    items = list(adapters_cfg.adapters.items())  # insertion order, validated non-empty by schema
+    first_name, first_cfg = items[0]
+
+    if not hasattr(first_cfg, "to_config"):
+        # The schema stores entries as raw dicts; re-materialize them into adapter configs via
+        # the adapter registry so each has a working `to_config()` method.
+        items = [(name, _materialize_adapter_config(cfg)) for name, cfg in items]
+        first_name, first_cfg = items[0]
+
+    first_peft_config = first_cfg.to_config(task_type=TaskType.CAUSAL_LM, tokenizer_name_or_path=config_obj.base_model)
+    model = get_peft_model(model, first_peft_config, adapter_name=first_name)
+
+    for name, adapter_cfg in items[1:]:
+        peft_config = adapter_cfg.to_config(task_type=TaskType.CAUSAL_LM, tokenizer_name_or_path=config_obj.base_model)
+        model.add_adapter(name, peft_config)
+
+    if adapters_cfg.merge is not None:
+        merge = adapters_cfg.merge
+        weights = merge.weights if merge.weights is not None else [1.0] * len(merge.sources)
+        kwargs = {
+            "adapters": merge.sources,
+            "weights": weights,
+            "adapter_name": merge.name,
+            "combination_type": merge.combination_type,
+        }
+        if merge.combination_type in ("ties", "dare_linear", "dare_ties", "magnitude_prune"):
+            kwargs["density"] = merge.density
+        model.add_weighted_adapter(**kwargs)
+        logger.info(
+            "Merged adapters %s (weights=%s) via %s into %r",
+            merge.sources,
+            weights,
+            merge.combination_type,
+            merge.name,
+        )
+
+    active = adapters_cfg.active or first_name
+    model.set_adapter(active)
+    logger.info("Registered adapters: %s (active=%s)", [n for n, _ in items], active)
+
+    return model
+
+
+def _materialize_adapter_config(raw):
+    """Turn a raw dict from ``adapters.adapters`` into a BaseAdapterConfig instance."""
+    from ludwig.schema.llms.peft import adapter_registry
+
+    if hasattr(raw, "to_config"):
+        return raw
+    if not isinstance(raw, dict):
+        raise TypeError(f"Expected dict adapter config, got {type(raw).__name__}")
+    adapter_type = raw.get("type")
+    if adapter_type is None:
+        raise ValueError("Adapter config is missing required `type` field.")
+    if adapter_type not in adapter_registry:
+        raise ValueError(f"Unknown adapter type {adapter_type!r}. Known: {list(adapter_registry.keys())}")
+    return adapter_registry[adapter_type].model_validate(raw)
+
+
+def get_context_len(model_config: AutoConfig):
+    """Determines the maximum length of the context (input + output tokens) based on the provided model
+    configuration.
+
+    Args:
+        model_config (AutoConfig): The model configuration object containing information about the model's properties.
+
+    Returns:
+        int: The maximum context length, which can be derived from the model configuration. If no relevant attribute
+             is found, the default value of 2048 is returned.
+
+    This function examines the provided model configuration object to identify the attribute that specifies the maximum
+    context length. It checks for attributes in the following order of preference:
+    1. 'max_sequence_length': If this attribute is present in the model configuration, its value is returned.
+    2. 'max_position_embeddings': If 'max_sequence_length' is not found but 'max_position_embeddings' is present, its
+       value is returned.
+    3. 'n_positions': If neither 'max_sequence_length' nor 'max_position_embeddings' are found, and 'n_positions' is
+       present, its value is returned.
+    4. Default: If none of the relevant attributes are present, the function returns a default value of 2048.
+
+    Note:
+    - The maximum context length is important for defining the size of input and output sequences in a model.
+
+    Example Usage:
+    >>> config = AutoConfig.from_pretrained("bert-base-uncased")
+    >>> context_len = get_context_len(config)
+    >>> print(context_len)
+    512
+    """
+    if hasattr(model_config, "max_sequence_length"):
+        return model_config.max_sequence_length
+    elif hasattr(model_config, "max_position_embeddings"):
+        return model_config.max_position_embeddings
+    elif hasattr(model_config, "n_positions"):
+        return model_config.n_positions
+    else:
+        return FALLBACK_CONTEXT_LEN
+
+
+def has_padding_token(input_tensor: torch.Tensor, tokenizer: PreTrainedTokenizer):
+    """Checks if the input tensor contains any padding tokens.
+
+    Args:
+        input_tensor (torch.Tensor): The input tensor.
+        tokenizer (PreTrainedTokenizer): The tokenizer used to encode the input.
+
+    Returns:
+        bool: True if the input tensor contains any padding tokens, False otherwise.
+
+    Example:
+        >>> import torch
+        >>> from transformers import PreTrainedTokenizer
+        >>> tokenizer = PreTrainedTokenizer.from_pretrained('bert-base-uncased')
+        >>> input_sentence = "This is an example sentence."
+        >>> input_ids = tokenizer.encode(input_sentence, add_special_tokens=True)
+        >>> padded_input_ids = torch.nn.functional.pad(input_ids, (0, 10 - len(input_ids)))
+        >>> has_padding = has_padding_token(padded_input_ids, tokenizer)
+        >>> has_padding
+        True
+    """
+    if input_tensor.dim() == 1:
+        return torch.any(input_tensor == tokenizer.pad_token_id).item()
+    elif input_tensor.dim() == 2:
+        return torch.any(input_tensor == tokenizer.pad_token_id, dim=-1).item()
+    else:
+        raise ValueError(
+            f"Input tensor must be 1D (single sequence) or 2D (batch of sequences), got {input_tensor.dim()}D tensor."
+        )
+
+
+def remove_left_padding(input_ids_sample: torch.Tensor, tokenizer: PreTrainedTokenizer):
+    """Removes left padding and other tokens until the first BOS token from the input_ids tensor.
+
+    Args:
+        input_ids_sample (torch.Tensor): The input tensor with padding and other tokens.
+        tokenizer (PreTrainedTokenizer): The tokenizer used to encode the input.
+
+    Returns:
+        torch.Tensor: The input tensor without left padding and other tokens until the first BOS token.
+
+    Example:
+        >>> import torch
+        >>> from transformers import PreTrainedTokenizer
+        >>> tokenizer = PreTrainedTokenizer.from_pretrained('bert-base-uncased')
+        >>> input_sentence = "This is an example sentence."
+        >>> input_ids = tokenizer.encode(input_sentence, add_special_tokens=True)
+        >>> padded_input_ids = torch.nn.functional.pad(input_ids, (10 - len(input_ids), 0))
+        >>> input_ids_no_padding = remove_left_padding(padded_input_ids, tokenizer)
+        >>> input_ids_no_padding
+        tensor([[1, 2, 3]])
+    """
+    # Remove all PAD tokens
+    pad_idxs = torch.where(input_ids_sample == tokenizer.pad_token_id)[0]  # all PAD token locations
+    input_ids_no_padding = input_ids_sample
+    if len(pad_idxs) != 0:
+        pad_idx = pad_idxs[-1]  # get last PAD token location
+        input_ids_no_padding = input_ids_sample[pad_idx + 1 :]
+
+    # Start from the first BOS token
+    bos_idxs = torch.where(input_ids_no_padding == tokenizer.bos_token_id)[0]  # all BOS token locations
+    if len(bos_idxs) != 0:
+        bos_idx = bos_idxs[0]  # get first BOS token location
+    else:
+        bos_idx = 0
+
+    input_ids_no_bos = input_ids_no_padding[bos_idx:].unsqueeze(0)
+    return input_ids_no_bos
+
+
+def add_left_padding(input_ids, max_length, pad_value=0):
+    """Adds left padding to the input_ids tensor.
+
+    Args:
+        input_ids (torch.Tensor): The input tensor.
+        max_length (int): The maximum length of the tensor after padding.
+        pad_value (int, optional): The value used for padding. Defaults to 0.
+
+    Returns:
+        torch.Tensor: The input_ids tensor with left padding.
+
+    Example:
+        >>> input_ids = torch.tensor([1, 2, 3])
+        >>> max_length = 5
+        >>> padded_tensor = add_left_padding(input_ids, max_length)
+        >>> padded_tensor
+        tensor([0, 0, 1, 2, 3])
+    """
+    padding = torch.tensor([pad_value] * (max_length - input_ids.shape[0]), dtype=torch.int64, device=input_ids.device)
+    return torch.cat((padding, input_ids), dim=-1)
+
+
+def create_attention_mask(input_ids: torch.Tensor, tokenizer: PreTrainedTokenizer):
+    """Creates an attention mask for the input_ids tensor. This also sets the last padding token ID to 1 if it
+    exists.
+
+    Args:
+        input_ids (torch.Tensor): The input tensor.
+        tokenizer (PreTrainedTokenizer): The tokenizer used to encode the input.
+
+    Returns:
+        torch.Tensor: The attention mask tensor.
+
+    Example:
+        >>> import torch # noqa
+        >>> from transformers import PreTrainedTokenizer
+        >>> tokenizer = PreTrainedTokenizer.from_pretrained('bert-base-uncased')
+        >>> input_sentence = "This is an example sentence."
+        >>> input_ids = tokenizer.encode(input_sentence, add_special_tokens=True)
+        >>> attention_mask = create_attention_mask(input_ids, tokenizer)
+        >>> attention_mask
+        tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    """
+    attention_mask = input_ids != tokenizer.pad_token_id
+    # Last token may not be padding if we've already hit the max sequence length
+    if not attention_mask[-1]:
+        # last token is padding, always attended to even if it is padding
+        attention_mask[-1] = 1
+    attention_mask = attention_mask.to(torch.int64)
+    return attention_mask
+
+
+def find_last_matching_index(tensor_a: torch.Tensor, tensor_b: torch.Tensor):
+    """Returns the last index of `tensor_a` that matches `tensor_b`. Specifically, this checks whether the tensor_b
+    is in the last tensor_b.shape[0] elements of tensor_a.
+
+    Args:
+        tensor_a (torch.Tensor): The first tensor.
+        tensor_b (torch.Tensor): The second tensor.
+
+    Returns:
+        int: The last index of `tensor_a` that matches `tensor_b`. Returns -1 if there is no matching index.
+
+    Example:
+        >>> import torch
+        >>> tensor_a = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
+        >>> tensor_b = torch.tensor([6, 7, 8])
+        >>> last_matching_index = find_last_matching_index(tensor_a, tensor_b)
+        >>> last_matching_index
+        5
+    """
+    last_index = -1
+
+    tensor_a_length = tensor_a.shape[0]
+    tensor_b_length = tensor_b.shape[0]
+
+    # Get the last tensor_b_length elements of tensor_a.
+    tensor_a_truncated = tensor_a[-tensor_b_length:]
+
+    # Find the last matching index.
+    for i in range(tensor_b_length):
+        if torch.equal(tensor_a_truncated[i:], tensor_b[: tensor_b_length - i]):
+            last_index = tensor_a_length - tensor_b_length + i
+            break
+
+    return last_index
+
+
+def pad_target_tensor_for_fine_tuning(
+    targets: dict[str, torch.Tensor],
+    predictions: dict[str, torch.Tensor],
+    model_inputs: torch.Tensor,
+    of_name: str,
+) -> dict[str, torch.Tensor]:
+    """Pad and adjust target tensors for fine-tuning LLMS models.
+
+    This function is used to pad and adjust the target tensors with IGNORE_INDEX_TOKEN_ID based on the model inputs and
+    predictions during the fine-tuning process of Language Models. Here's what this function does:
+        1. If none of the tokens from the target were in the model inputs, we create a tensor of the length of model
+            inputs with value IGNORE_INDEX_TOKEN_IDs. This ignores this row from affecting loss.
+        2. If the target tokens were entirely inside the model inputs, we want to pad all the tokens in model_inputs
+            coming from the input with IGNORE_INDEX_TOKEN_IDs and leave the target tokens as is. This ensures that all
+            of the target tokens are used during loss computation.
+        3. In the scenario that only some part of the target tokens were in the model inputs, we want to pad the model
+            inputs until that point and only leave the partial tokens of the target as is. This ensures that we will
+            only compute loss on the target tokens that were in the model inputs.
+
+    Args:
+        targets (Dict[str, torch.Tensor]): A dictionary containing the target tensors.
+        predictions (Dict[str, torch.Tensor]): A dictionary containing the predicted tensors.
+        model_inputs (torch.Tensor): The input tensor passed into the model's forward pass.
+        of_name (str): The name of the target tensor to be padded and adjusted.
+
+    Returns:
+        Dict[str, torch.Tensor]: A dictionary containing the updated target
+        dictionaries.
+    """
+    target_length = targets.get(of_name).size()[1]
+    prediction_length = predictions[of_name].get(PREDICTIONS).size()[1]
+
+    if target_length == prediction_length:
+        return targets
+
+    updated_targets = []
+    for idx, target in enumerate(targets[of_name]):
+        # Remove any leading IGNORE_INDEX_TOKEN_IDs in the target that were temporarily added for alignment
+        end_index = (target != IGNORE_INDEX_TOKEN_ID).nonzero()[0]
+        target = target[end_index:]
+        target_device = target.device
+
+        # See if any part of the target was in the tensor passed into the model's forward pass
+        last_matching_index = find_last_matching_index(model_inputs[idx], target)
+
+        # If the last matching index is -1, it means that the input tensor passed into the model was truncated
+        # and did not contain the target tensor. In this case, we need to truncate the target tensors as well
+        # and just set it to a tensor of IGNORE_INDEX_TOKEN_ID so that we don't compute loss on this target tensor.
+        if last_matching_index == -1:
+            updated_targets.append(torch.full((prediction_length,), IGNORE_INDEX_TOKEN_ID).to(device=target_device))
+
+        # If the last matching index is not -1, it means that the input tensor passed into the model was not
+        # truncated and contained either a part of the target tensor or the entire target tensor. In this case,
+        # we need to set the target tensor to the part of the target tensor that was passed into the model while
+        # also padding it to the correct length with IGNORE_INDEX_TOKEN_ID.
+        else:
+            padding = torch.full((last_matching_index,), IGNORE_INDEX_TOKEN_ID).to(device=target_device)
+            updated_targets.append(torch.cat((padding, target), dim=-1)[:prediction_length])
+
+    targets[of_name] = torch.stack(updated_targets).to(device=targets.get(of_name).device, dtype=torch.int64)
+
+    return targets
+
+
+def generate_merged_ids(
+    input_ids: torch.tensor,
+    target_ids: torch.tensor,
+    tokenizer: PreTrainedTokenizer,
+    max_sequence_length: int | None = None,
+):
+    """Generate merged input and target IDs tensor.
+
+    This function merges the input_ids and target_ids together to create a unified tensor
+    to pass into the model. It also returns attention masks for the merged tensors.
+
+    Args:
+        input_ids (torch.Tensor): The input IDs tensor.
+        target_ids (torch.Tensor or None): The target IDs tensor or None.
+        max_sequence_length (int or None): The maximum sequence length to pad or truncate to.
+        tokenizer (PreTrainedTokenizer): The tokenizer used to encode the input_ids and target_ids.
+
+    Returns:
+        torch.Tensor: The merged input and target IDs tensor.
+        torch.Tensor: The attention masks for the merged tensor.
+    """
+    merged_input_and_targets = []
+    lengths = []
+
+    eos_tensor = torch.tensor([tokenizer.eos_token_id]).to(target_ids[0].device)
+
+    # Merge input_ids and target_ids by concatenating them together.
+    # We remove the left padding from both input_ids and target_ids before concatenating them.
+    for input_id_sample, target_id_sample in zip(input_ids, target_ids):
+        input_id_sample_no_padding = remove_left_padding(input_id_sample, tokenizer)[0]
+        target_id_sample_no_padding = remove_left_padding(target_id_sample, tokenizer)[0]
+        target_id_sample_no_padding = torch.cat((target_id_sample_no_padding, eos_tensor), dim=-1)
+
+        merged_sample_ids = torch.cat((input_id_sample_no_padding, target_id_sample_no_padding), dim=-1)
+        # If the merged tensor is longer than the maximum sequence length, we truncate it.
+        if max_sequence_length and merged_sample_ids.shape[0] > max_sequence_length:
+            merged_sample_ids = merged_sample_ids[:max_sequence_length]
+
+        merged_input_and_targets.append(merged_sample_ids)
+        lengths.append(merged_sample_ids.shape[0])
+
+    # Since we remove the left padding from the target_ids, the merged input_ids and target_ids
+    # may not have the same lengths. We need to align them to the same length by adding left padding
+    # and generate an attention mask for just the part of the input that is not padding.
+    max_length = max(lengths)
+    attention_masks = []
+    for i, merged_sample_ids in enumerate(merged_input_and_targets):
+        merged_input_and_targets[i] = add_left_padding(merged_sample_ids, max_length)
+        attention_masks.append(create_attention_mask(merged_input_and_targets[i], tokenizer))
+
+    return torch.stack(merged_input_and_targets), torch.stack(attention_masks)
+
+
+def _get_decoded_targets_and_predictions(
+    targets: dict[str, torch.Tensor],
+    predictions: dict[str, dict[str, torch.Tensor]],
+    tokenizer: PreTrainedTokenizer,
+    of_name: str,
+):
+    """Returns the decoded targets and predictions, accounting for IGNORE_INDEX_TOKEN_ID."""
+    target_tensor = targets[of_name]
+    pred_tensor = predictions[of_name][PREDICTIONS]
+    # Ensure targets and predictions are on the same device
+    if target_tensor.device != pred_tensor.device:
+        target_tensor = target_tensor.to(pred_tensor.device)
+    sanitized_targets = torch.where(target_tensor != IGNORE_INDEX_TOKEN_ID, target_tensor, tokenizer.pad_token_id)
+    sanitized_predictions = torch.where(
+        pred_tensor != IGNORE_INDEX_TOKEN_ID,
+        pred_tensor,
+        tokenizer.pad_token_id,
+    )
+    decoded_targets = tokenizer.batch_decode(sanitized_targets, skip_special_tokens=True)
+    decoded_predictions = tokenizer.batch_decode(sanitized_predictions, skip_special_tokens=True)
+    return decoded_targets, decoded_predictions
+
+
+def get_realigned_target_and_prediction_tensors_for_inference(
+    targets: dict[str, torch.Tensor],
+    predictions: dict[str, dict[str, torch.Tensor]],
+    of_name: str,
+    tokenizer: PreTrainedTokenizer,
+    pad_value: int | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Realigns the target tensor with the predictions.
+
+    This is necessary for text metrics that require the target and prediction to be of the same length.
+
+    Args:
+        targets: The target tensor.
+        predictions: The prediction tensor.
+        of_name: The output feature's name.
+        tokenizer: The HF tokenizer.
+        pad_direction: The direction to pad the tensors. Can be 'left' or 'right'.
+            Defaults to 'right'.
+
+    Returns:
+        Tuple of realigned (targets, decoded_targets, predictions, decoded_predictions).
+        - targets is a map of feature name -> tensor of token ids.
+        - predictions is a map from output feature name -> map of tensors with the following items:
+            - "predictions": tensor of token ids.
+            - "probabilities": tensor of probabilities.
+            - "logits": tensor of logits.
+    """
+    target_length = targets.get(of_name).size()[1]
+    prediction_length = predictions[of_name].get(PREDICTIONS).size()[1]
+
+    if target_length == prediction_length:
+        return targets, predictions
+
+    if not pad_value:
+        pad_value = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    zeros_to_add = (
+        target_length - prediction_length if target_length > prediction_length else prediction_length - target_length
+    )
+
+    # We don't want to modify the original targets and predictions tensors, so we create a copy of them.
+    _targets = copy.deepcopy(targets)
+    _predictions = copy.deepcopy(predictions)
+
+    # Align target and prediction tensors for text to text metric computation
+    if target_length > prediction_length:
+        # Pad the predictions.
+        _predictions[of_name][PREDICTIONS] = F.pad(
+            _predictions[of_name][PREDICTIONS], (0, zeros_to_add), value=pad_value
+        ).to(torch.int64)
+
+        _predictions[of_name][PROBABILITIES] = F.pad(_predictions[of_name][PROBABILITIES], (0, 0, 0, zeros_to_add)).to(
+            torch.float32
+        )
+
+        _predictions[of_name][LOGITS] = F.pad(_predictions[of_name][LOGITS], (0, 0, 0, zeros_to_add)).to(torch.float32)
+    else:
+        _targets[of_name] = F.pad(_targets[of_name], (0, zeros_to_add), value=pad_value).to(torch.int64)
+
+    return _targets, _predictions
+
+
+def update_embedding_layer(model: AutoModelForCausalLM, config_obj: LLMTrainerConfig) -> AutoModelForCausalLM:
+    """Updates the embedding layer of the model to use the 8-bit embedding layer from bitsandbytes.nn.modules.
+
+    This is necessary when using 8-bit optimizers from bitsandbytes.
+    See: https://github.com/TimDettmers/bitsandbytes#tldr
+    """
+    # If we're using an 8-bit optimizer, we need to replace the embedding layer with a custom embedding layer from
+    # bnb.nn.modules.Embedding.
+    if hasattr(config_obj, "optimizer") and config_obj.optimizer.is_8bit:
+        embedding_layer, module_path = find_embedding_layer_with_path(model)
+        if embedding_layer is None:
+            raise ValueError(
+                "Could not find an embedding layer in the model. This is required when using 8-bit optimizers"
+                "  since a custom 8-bit embedding layer is used in place of the original embedding layer."
+            )
+
+        # Initialize the BNB embedding layer with the same parameters and weights as the original embedding layer.
+        bnb_embedding = BnbEmbedding(
+            num_embeddings=embedding_layer.num_embeddings,
+            embedding_dim=embedding_layer.embedding_dim,
+            padding_idx=embedding_layer.padding_idx,
+            max_norm=embedding_layer.max_norm,
+            norm_type=embedding_layer.norm_type,
+            scale_grad_by_freq=embedding_layer.scale_grad_by_freq,
+            sparse=embedding_layer.sparse,
+            _weight=embedding_layer.weight,
+            device=model.device,
+        )
+
+        # Update the model's original embedding layer to use the BNB embedding layer using the module_path
+        # returned by find_embedding_layer_with_path.
+        module_path = module_path.split(".")
+        module = model
+        for module_name in module_path[:-1]:
+            module = getattr(module, module_name)
+        setattr(module, module_path[-1], bnb_embedding)
+
+        # Set the get input embeddings lambda function to return the BNB embedding layer
+        model.get_input_embeddings = lambda: bnb_embedding
+
+        logger.info("Updated the pretrained embedding layer to use the embedding layer from bitsandbytes.")
+
+    return model
+
+
+def create_text_streamer(tokenizer: PreTrainedTokenizer) -> TextStreamer:
+    """Creates a TextStreamer object for streaming text to stdout during generation."""
+    return TextStreamer(tokenizer=tokenizer, skip_prompt=True)
+
+
+def generate_merged_ids_packed(
+    input_ids: torch.tensor,
+    target_ids: torch.tensor,
+    tokenizer,
+    max_sequence_length: int | None = None,
+    max_sequences_per_pack: int = 8,
+):
+    """Generate merged IDs with sequence packing for throughput improvement.
+
+    Instead of padding each sequence to the same length, packs multiple short
+    sequences into a single batch entry with block-diagonal attention masks
+    to prevent cross-sequence attention.
+
+    Args:
+        input_ids: [batch, input_len] token IDs for prompts
+        target_ids: [batch, target_len] token IDs for completions
+        tokenizer: HuggingFace tokenizer
+        max_sequence_length: Maximum pack length
+        max_sequences_per_pack: Maximum sequences per pack
+
+    Returns:
+        packed_ids: [num_packs, max_seq_len] packed token IDs
+        packed_attention_mask: [num_packs, max_seq_len, max_seq_len] block-diagonal attention
+    """
+    from ludwig.utils.sequence_packing import pack_sequences
+
+    # First, merge each input+target pair into a single sequence (without padding)
+    merged_sequences = []
+    eos_tensor = torch.tensor([tokenizer.eos_token_id]).to(target_ids[0].device)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    for input_id_sample, target_id_sample in zip(input_ids, target_ids):
+        input_no_pad = remove_left_padding(input_id_sample, tokenizer)[0]
+        target_no_pad = remove_left_padding(target_id_sample, tokenizer)[0]
+        target_no_pad = torch.cat((target_no_pad, eos_tensor), dim=-1)
+        merged = torch.cat((input_no_pad, target_no_pad), dim=-1)
+        if max_sequence_length and merged.shape[0] > max_sequence_length:
+            merged = merged[:max_sequence_length]
+        merged_sequences.append(merged)
+
+    # Create dummy attention masks (all ones, actual masking done by block-diagonal)
+    attention_masks = [torch.ones(seq.shape[0]) for seq in merged_sequences]
+
+    # Pack sequences using greedy bin packing
+    packed_ids, packed_attn, _, _ = pack_sequences(
+        merged_sequences,
+        attention_masks,
+        max_length=max_sequence_length or max(s.shape[0] for s in merged_sequences),
+        pad_token_id=pad_token_id,
+        max_sequences_per_pack=max_sequences_per_pack,
+    )
+
+    return packed_ids, packed_attn
